@@ -5,17 +5,21 @@ import logging
 import uuid
 import shutil
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    ReplyKeyboardRemove
+)
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ================= CONFIGURATION =================
-# آپ کی دی گئی تفصیلات
 API_ID = 94575
 API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2"
 BOT_TOKEN = "8505785410:AAGiDN3FuECbg_K6N_qtjK7OjXh1YYPy5fk"
 MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
 
-# Owner IDs
 OWNER_IDS = [8167904992, 7134046678] 
 
 # ================= DATABASE SETUP =================
@@ -26,8 +30,8 @@ keys_col = db["access_keys"]
 projects_col = db["projects"]
 
 # ================= GLOBAL VARIABLES =================
-ACTIVE_PROCESSES = {} # Stores running processes
-USER_STATE = {} # Stores what the user is doing
+ACTIVE_PROCESSES = {} 
+USER_STATE = {} 
 
 logging.basicConfig(level=logging.INFO)
 app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -50,7 +54,6 @@ def get_main_menu(user_id):
     return InlineKeyboardMarkup(btns)
 
 async def stop_project_process(project_id):
-    """Safely kills a running process"""
     if project_id in ACTIVE_PROCESSES:
         proc = ACTIVE_PROCESSES[project_id]
         try:
@@ -69,11 +72,13 @@ async def stop_project_process(project_id):
 async def start_command(client, message):
     user_id = message.from_user.id
     
+    # Reset State just in case
+    if user_id in USER_STATE: del USER_STATE[user_id]
+
     if await is_authorized(user_id):
         await message.reply_text(
             f"👋 **Welcome back, {message.from_user.first_name}!**\n\n"
-            "Current System: **Unlimited Files Support**\n"
-            "Select an option below:",
+            "Master Bot Panel is ready.\nSelect an option below:",
             reply_markup=get_main_menu(user_id)
         )
     else:
@@ -128,7 +133,7 @@ async def handle_text_input(client, message):
     if user_id in USER_STATE:
         state = USER_STATE[user_id]
         
-        # Step 1: Set Project Name
+        # --- PROJECT NAME INPUT ---
         if state["step"] == "ask_name":
             proj_name = message.text.strip().replace(" ", "_")
             
@@ -136,95 +141,86 @@ async def handle_text_input(client, message):
             if exist:
                 return await message.reply("❌ Name already exists. Try another.")
             
-            # Change state to wait for MULTIPLE files
-            USER_STATE[user_id] = {"step": "wait_files", "name": proj_name, "file_count": 0}
+            # Change state to wait for files
+            USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
+            
+            # SHOW PERSISTENT KEYBOARD (REPLY KEYBOARD)
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton("✅ Done / Start Deploy")]], 
+                resize_keyboard=True
+            )
             
             await message.reply(
                 f"✅ Project Name: `{proj_name}`\n\n"
                 "**Now send your files.**\n"
-                "You can send as many files as you want (Images, .py, .txt, etc).\n\n"
-                "⚠️ **IMPORTANT:** One file MUST be named `main.py`.\n\n"
-                "When you are finished sending files, click the **Done** button below.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done / Start Deploy", callback_data="deploy_finish")]])
+                "(Send as many files as you want. Main file must be `main.py`).\n\n"
+                "👇 **Press the button below when finished.**",
+                reply_markup=keyboard
             )
+
+        # --- HANDLE "DONE" BUTTON PRESS (TEXT HANDLER) ---
+        elif message.text == "✅ Done / Start Deploy":
+            if state["step"] == "wait_files":
+                await finish_deployment(client, message)
 
 @app.on_message(filters.document & filters.private)
 async def handle_file_upload(client, message):
     user_id = message.from_user.id
     
-    # Check if user is in 'uploading' state (either Deployment or Update)
     if user_id in USER_STATE and USER_STATE[user_id]["step"] in ["wait_files", "update_files"]:
         data = USER_STATE[user_id]
         proj_name = data["name"]
         file_name = message.document.file_name
         
-        # Determine path
         base_path = f"./deployments/{user_id}/{proj_name}"
         os.makedirs(base_path, exist_ok=True)
         
-        # Download and Save
         save_path = os.path.join(base_path, file_name)
         await message.download(save_path)
         
-        # Increment counter just for feedback
-        if "file_count" in data:
-            data["file_count"] += 1
-        
-        # If this is Update Mode, show Restart Button immediately
+        # If updating, show restart inline button
         if data["step"] == "update_files":
             await message.reply(
-                f"📥 **Updated:** `{file_name}`\n"
-                "Send more files or click Restart to apply changes.",
+                f"📥 **Updated:** `{file_name}`",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart Bot", callback_data=f"act_restart_{proj_name}")]])
             )
         else:
-            # Deployment Mode
-            await message.reply(
-                f"📥 **Received:** `{file_name}`\n"
-                "Keep sending files...",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done / Start Deploy", callback_data="deploy_finish")]])
-            )
+            # Deployment mode: Just acknowledge, don't spam buttons
+            await message.reply(f"📥 **Received:** `{file_name}`")
 
-@app.on_callback_query(filters.regex("deploy_finish"))
-async def finish_deployment(client, callback):
-    user_id = callback.from_user.id
-    if user_id not in USER_STATE or USER_STATE[user_id]["step"] != "wait_files":
-        return await callback.answer("Session expired.", show_alert=True)
-    
+# Logic to finish deployment (Triggered by Text Button)
+async def finish_deployment(client, message):
+    user_id = message.from_user.id
     proj_name = USER_STATE[user_id]["name"]
     base_path = f"./deployments/{user_id}/{proj_name}"
     
-    # Validation: Check if main.py exists
+    # Check for main.py
     if not os.path.exists(os.path.join(base_path, "main.py")):
-        return await callback.answer("❌ Error: main.py file is missing! Please send main.py.", show_alert=True)
+        return await message.reply("❌ **Error:** `main.py` is missing! Please upload it before clicking Done.")
     
-    # Clear State
+    # Remove the Keyboard
+    await message.reply("⚙️ **Starting Deployment...**", reply_markup=ReplyKeyboardRemove())
+    
     del USER_STATE[user_id]
-    
-    # Start the actual deployment
-    await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
+    await start_process_logic(client, message.chat.id, user_id, proj_name)
 
 async def start_process_logic(client, chat_id, user_id, proj_name):
     base_path = f"./deployments/{user_id}/{proj_name}"
-    msg = await client.send_message(chat_id, f"⚙️ **Processing {proj_name}...**")
+    msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
-    # 1. Install Requirements (Only if requirements.txt exists)
+    # Install Reqs
     if os.path.exists(os.path.join(base_path, "requirements.txt")):
-        await msg.edit_text("📥 **Installing Requirements...**")
+        await msg.edit_text("📥 **Installing Libraries...**")
         install_cmd = f"pip install -r {base_path}/requirements.txt"
         proc = await asyncio.create_subprocess_shell(
             install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await proc.communicate()
-        if proc.returncode != 0:
-            await msg.edit_text("⚠️ **Warning:** Requirements installation had some errors, but trying to start bot anyway.")
 
-    # 2. Run Python Script
-    await msg.edit_text("🚀 **Starting Bot...**")
-    
+    # Run Script
+    await msg.edit_text("🚀 **Launching Bot...**")
     log_file = open(f"{base_path}/runtime_error.log", "w")
     
-    # ALWAYS run main.py
     run_proc = await asyncio.create_subprocess_exec(
         "python3", "main.py",
         cwd=base_path,
@@ -232,7 +228,6 @@ async def start_process_logic(client, chat_id, user_id, proj_name):
         stderr=log_file
     )
     
-    # Save State
     project_id = f"{user_id}_{proj_name}"
     ACTIVE_PROCESSES[project_id] = run_proc
     
@@ -242,9 +237,9 @@ async def start_process_logic(client, chat_id, user_id, proj_name):
         upsert=True
     )
     
-    await msg.edit_text(f"✅ **{proj_name} is Online!**")
+    await msg.edit_text(f"✅ **{proj_name} is Online!**", reply_markup=get_main_menu(user_id))
     
-    # 3. Crash Monitor
+    # Monitor Crash
     await asyncio.sleep(5)
     if run_proc.returncode is not None:
         log_file.close()
@@ -262,6 +257,7 @@ async def list_projects(client, callback):
     btns = []
     async for p in projects:
         status = "🟢" if p.get("status") == "Running" else "🔴"
+        # Using "p_menu_" prefix to identify clicks
         btns.append([InlineKeyboardButton(f"{status} {p['name']}", callback_data=f"p_menu_{p['name']}")])
     
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
@@ -269,8 +265,13 @@ async def list_projects(client, callback):
 
 @app.on_callback_query(filters.regex(r"^p_menu_"))
 async def project_menu(client, callback):
-    proj_name = callback.data.split("_")[2]
-    
+    # FIXED: Handling names with underscores
+    # split("_", 2) means split only the first 2 underscores, keep the rest as name
+    try:
+        proj_name = callback.data.split("_", 2)[2]
+    except IndexError:
+        return await callback.answer("Error parsing name", show_alert=True)
+
     btns = [
         [InlineKeyboardButton("🛑 Stop", callback_data=f"act_stop_{proj_name}"), InlineKeyboardButton("▶️ Start", callback_data=f"act_start_{proj_name}")],
         [InlineKeyboardButton("♻️ Restart", callback_data=f"act_restart_{proj_name}")],
@@ -282,12 +283,24 @@ async def project_menu(client, callback):
 
 @app.on_callback_query(filters.regex(r"^act_"))
 async def project_actions(client, callback):
-    action, proj_name = callback.data.split("_")[1], callback.data.split("_")[2]
+    # FIXED: Handling names with underscores correctly
+    try:
+        parts = callback.data.split("_", 2) # Limit split to 2
+        action = parts[1]
+        proj_name = parts[2]
+    except IndexError:
+        return await callback.answer("Error parsing data", show_alert=True)
+
     user_id = callback.from_user.id
     proj_id = f"{user_id}_{proj_name}"
     
     doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
-    if not doc: return await callback.answer("Not found.")
+    
+    # Debugging print (Optional, remove in production)
+    print(f"User: {user_id}, Action: {action}, Project: {proj_name}, Found: {doc is not None}")
+
+    if not doc: 
+        return await callback.answer("❌ Project Not Found in Database!", show_alert=True)
 
     if action == "stop":
         await stop_project_process(proj_id)
@@ -312,20 +325,19 @@ async def project_actions(client, callback):
         await list_projects(client, callback)
 
     elif action == "update":
-        # Enable update mode
         USER_STATE[user_id] = {"step": "update_files", "name": proj_name}
         await callback.message.edit_text(
             f"📤 **Update Mode: {proj_name}**\n\n"
-            "Send **ANY** file (Python, Images, Txt) here.\n"
-            "If the file exists, it will be replaced.\n"
-            "If it's new, it will be added.\n\n"
-            "Click **Restart** when you are done sending files.",
-             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="manage_projects")]])
+            "Send new files here.\n"
+            "Click **Back** to cancel.",
+             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]])
         )
 
 # ================= NAVIGATION =================
 @app.on_callback_query(filters.regex("main_menu"))
 async def back_main(client, callback):
+    if callback.from_user.id in USER_STATE:
+        del USER_STATE[callback.from_user.id]
     await callback.message.edit_text("🏠 **Main Menu**", reply_markup=get_main_menu(callback.from_user.id))
 
 if __name__ == "__main__":
