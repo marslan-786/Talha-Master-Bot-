@@ -66,26 +66,53 @@ async def stop_project_process(project_id):
             logging.error(f"Error killing process: {e}")
         del ACTIVE_PROCESSES[project_id]
 
+# ================= AUTO-RESTORE SYSTEM (NEW) =================
+# یہ فنکشن بوٹ اسٹارٹ ہوتے ہی چلے گا اور ڈیٹا بیس سے فائلیں واپس لائے گا
+
+async def restore_all_projects():
+    print("🔄 Checking for projects to restore...")
+    async for project in projects_col.find({"status": "Running"}):
+        user_id = project["user_id"]
+        proj_name = project["name"]
+        base_path = f"./deployments/{user_id}/{proj_name}"
+        
+        # اگر فولڈر نہیں ہے (مطلب ریلوے نے اڑا دیا)، تو دوبارہ بنائیں
+        if not os.path.exists(base_path):
+            print(f"♻️ Restoring Files for: {proj_name}")
+            os.makedirs(base_path, exist_ok=True)
+            
+            # ڈیٹا بیس سے فائلیں نکال کر ڈسک پر لکھیں
+            files_data = project.get("stored_files", {})
+            for fname, fcontent in files_data.items():
+                with open(os.path.join(base_path, fname), "wb") as f:
+                    f.write(fcontent)
+            
+            # دوبارہ چلائیں
+            await start_process_logic(None, None, user_id, proj_name, silent=True)
+        else:
+            # اگر فولڈر ہے لیکن پروسیس نہیں چل رہا
+            project_id = f"{user_id}_{proj_name}"
+            if project_id not in ACTIVE_PROCESSES:
+                 await start_process_logic(None, None, user_id, proj_name, silent=True)
+
 # ================= START & AUTH FLOW =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     user_id = message.from_user.id
-    
-    # Reset State just in case
     if user_id in USER_STATE: del USER_STATE[user_id]
 
     if await is_authorized(user_id):
         await message.reply_text(
             f"👋 **Welcome back, {message.from_user.first_name}!**\n\n"
-            "Master Bot Panel is ready.\nSelect an option below:",
+            "**System Status:** Persistent Storage Enabled ✅\n"
+            "Projects will auto-restore after updates.",
             reply_markup=get_main_menu(user_id)
         )
     else:
         if len(message.command) > 1:
             token = message.command[1]
             key_doc = await keys_col.find_one({"key": token, "status": "active"})
-            
             if key_doc:
                 await keys_col.update_one({"_id": key_doc["_id"]}, {"$set": {"status": "used", "used_by": user_id}})
                 await users_col.insert_one({"user_id": user_id, "joined_at": message.date})
@@ -101,7 +128,6 @@ async def start_command(client, message):
 async def owner_panel_cb(client, callback):
     if callback.from_user.id not in OWNER_IDS:
         return await callback.answer("Admins only!", show_alert=True)
-    
     btns = [
         [InlineKeyboardButton("🔑 Generate Key", callback_data="gen_key")],
         [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
@@ -121,9 +147,7 @@ async def deploy_start(client, callback):
     user_id = callback.from_user.id
     USER_STATE[user_id] = {"step": "ask_name"}
     await callback.message.edit_text(
-        "📂 **New Project**\n\n"
-        "Please send a **Name** for your project.\n"
-        "(No spaces, e.g., `MusicBot`)", 
+        "📂 **New Project**\nSend a **Name** (No spaces, e.g., `MusicBot`)", 
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]])
     )
 
@@ -132,33 +156,18 @@ async def handle_text_input(client, message):
     user_id = message.from_user.id
     if user_id in USER_STATE:
         state = USER_STATE[user_id]
-        
-        # --- PROJECT NAME INPUT ---
         if state["step"] == "ask_name":
             proj_name = message.text.strip().replace(" ", "_")
-            
             exist = await projects_col.find_one({"user_id": user_id, "name": proj_name})
-            if exist:
-                return await message.reply("❌ Name already exists. Try another.")
+            if exist: return await message.reply("❌ Name exists. Try another.")
             
-            # Change state to wait for files
             USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
-            
-            # SHOW PERSISTENT KEYBOARD (REPLY KEYBOARD)
-            keyboard = ReplyKeyboardMarkup(
-                [[KeyboardButton("✅ Done / Start Deploy")]], 
-                resize_keyboard=True
-            )
-            
+            keyboard = ReplyKeyboardMarkup([[KeyboardButton("✅ Done / Start Deploy")]], resize_keyboard=True)
             await message.reply(
-                f"✅ Project Name: `{proj_name}`\n\n"
-                "**Now send your files.**\n"
-                "(Send as many files as you want. Main file must be `main.py`).\n\n"
-                "👇 **Press the button below when finished.**",
+                f"✅ Project: `{proj_name}`\n**Now send files.**\n(Main file MUST be `main.py`).\nPress Button when done. 👇",
                 reply_markup=keyboard
             )
 
-        # --- HANDLE "DONE" BUTTON PRESS (TEXT HANDLER) ---
         elif message.text == "✅ Done / Start Deploy":
             if state["step"] == "wait_files":
                 await finish_deployment(client, message)
@@ -166,7 +175,6 @@ async def handle_text_input(client, message):
 @app.on_message(filters.document & filters.private)
 async def handle_file_upload(client, message):
     user_id = message.from_user.id
-    
     if user_id in USER_STATE and USER_STATE[user_id]["step"] in ["wait_files", "update_files"]:
         data = USER_STATE[user_id]
         proj_name = data["name"]
@@ -174,78 +182,80 @@ async def handle_file_upload(client, message):
         
         base_path = f"./deployments/{user_id}/{proj_name}"
         os.makedirs(base_path, exist_ok=True)
-        
         save_path = os.path.join(base_path, file_name)
+        
+        # 1. Save to Disk
         await message.download(save_path)
         
-        # If updating, show restart inline button
+        # 2. Read Bytes and Save to DB (PERSISTENCE MAGIC)
+        with open(save_path, "rb") as f:
+            file_content = f.read()
+            
+        await projects_col.update_one(
+            {"user_id": user_id, "name": proj_name},
+            {"$set": {f"stored_files.{file_name.replace('.', '_DO_')}" : file_content}}, # Dot replace for mongo key safety
+            upsert=True
+        )
+        # Note: In Mongo keys, dots are restricted, so we replace '.' with '_DO_' temporarily, 
+        # but simpler logic for now: Just storing binary content mapped to filename is complex in keys.
+        # BETTER APPROACH:
+        await projects_col.update_one(
+            {"user_id": user_id, "name": proj_name},
+            {"$set": {f"stored_files.{file_name}": file_content}}, 
+            upsert=True
+        )
+
         if data["step"] == "update_files":
-            await message.reply(
-                f"📥 **Updated:** `{file_name}`",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart Bot", callback_data=f"act_restart_{proj_name}")]])
-            )
+            await message.reply(f"📥 **Updated & Saved to DB:** `{file_name}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart", callback_data=f"act_restart_{proj_name}")]]))
         else:
-            # Deployment mode: Just acknowledge, don't spam buttons
             await message.reply(f"📥 **Received:** `{file_name}`")
 
-# Logic to finish deployment (Triggered by Text Button)
 async def finish_deployment(client, message):
     user_id = message.from_user.id
     proj_name = USER_STATE[user_id]["name"]
     base_path = f"./deployments/{user_id}/{proj_name}"
     
-    # Check for main.py
     if not os.path.exists(os.path.join(base_path, "main.py")):
-        return await message.reply("❌ **Error:** `main.py` is missing! Please upload it before clicking Done.")
+        return await message.reply("❌ `main.py` missing!")
     
-    # Remove the Keyboard
     await message.reply("⚙️ **Starting Deployment...**", reply_markup=ReplyKeyboardRemove())
-    
     del USER_STATE[user_id]
     await start_process_logic(client, message.chat.id, user_id, proj_name)
 
-async def start_process_logic(client, chat_id, user_id, proj_name):
+async def start_process_logic(client, chat_id, user_id, proj_name, silent=False):
     base_path = f"./deployments/{user_id}/{proj_name}"
-    msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
-    # Install Reqs
+    # If client/chat_id is None (Auto Restore Mode), we just print logs
+    if not silent and client:
+        msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
+    
     if os.path.exists(os.path.join(base_path, "requirements.txt")):
-        await msg.edit_text("📥 **Installing Libraries...**")
+        if not silent and client: await msg.edit_text("📥 **Installing Libraries...**")
         install_cmd = f"pip install -r {base_path}/requirements.txt"
-        proc = await asyncio.create_subprocess_shell(
-            install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_shell(install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
 
-    # Run Script
-    await msg.edit_text("🚀 **Launching Bot...**")
-    log_file = open(f"{base_path}/runtime_error.log", "w")
+    if not silent and client: await msg.edit_text("🚀 **Launching Bot...**")
     
-    run_proc = await asyncio.create_subprocess_exec(
-        "python3", "main.py",
-        cwd=base_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=log_file
-    )
+    log_file = open(f"{base_path}/runtime_error.log", "w")
+    run_proc = await asyncio.create_subprocess_exec("python3", "main.py", cwd=base_path, stdout=asyncio.subprocess.PIPE, stderr=log_file)
     
     project_id = f"{user_id}_{proj_name}"
     ACTIVE_PROCESSES[project_id] = run_proc
     
-    await projects_col.update_one(
-        {"user_id": user_id, "name": proj_name},
-        {"$set": {"status": "Running", "main_file": "main.py", "path": base_path}},
-        upsert=True
-    )
+    await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Running", "path": base_path}})
     
-    await msg.edit_text(f"✅ **{proj_name} is Online!**", reply_markup=get_main_menu(user_id))
+    if not silent and client:
+        await msg.edit_text(f"✅ **{proj_name} is Online!**", reply_markup=get_main_menu(user_id))
     
-    # Monitor Crash
+    # Crash Monitor
     await asyncio.sleep(5)
     if run_proc.returncode is not None:
         log_file.close()
-        await client.send_document(chat_id, f"{base_path}/runtime_error.log", caption=f"⚠️ **{proj_name} Crashed!**")
         del ACTIVE_PROCESSES[project_id]
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Crashed"}})
+        if not silent and client:
+             await client.send_document(chat_id, f"{base_path}/runtime_error.log", caption=f"⚠️ **{proj_name} Crashed!**")
 
 # ================= MANAGEMENT FLOW =================
 
@@ -253,29 +263,21 @@ async def start_process_logic(client, chat_id, user_id, proj_name):
 async def list_projects(client, callback):
     user_id = callback.from_user.id
     projects = projects_col.find({"user_id": user_id})
-    
     btns = []
     async for p in projects:
         status = "🟢" if p.get("status") == "Running" else "🔴"
-        # Using "p_menu_" prefix to identify clicks
         btns.append([InlineKeyboardButton(f"{status} {p['name']}", callback_data=f"p_menu_{p['name']}")])
-    
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
     await callback.message.edit_text("📂 **Your Projects**", reply_markup=InlineKeyboardMarkup(btns))
 
 @app.on_callback_query(filters.regex(r"^p_menu_"))
 async def project_menu(client, callback):
-    # FIXED: Handling names with underscores
-    # split("_", 2) means split only the first 2 underscores, keep the rest as name
-    try:
-        proj_name = callback.data.split("_", 2)[2]
-    except IndexError:
-        return await callback.answer("Error parsing name", show_alert=True)
-
+    try: proj_name = callback.data.split("_", 2)[2]
+    except: return
     btns = [
         [InlineKeyboardButton("🛑 Stop", callback_data=f"act_stop_{proj_name}"), InlineKeyboardButton("▶️ Start", callback_data=f"act_start_{proj_name}")],
         [InlineKeyboardButton("♻️ Restart", callback_data=f"act_restart_{proj_name}")],
-        [InlineKeyboardButton("📤 Add/Update Files", callback_data=f"act_update_{proj_name}")],
+        [InlineKeyboardButton("📤 Update Files", callback_data=f"act_update_{proj_name}")],
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_delete_{proj_name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]
     ]
@@ -283,27 +285,17 @@ async def project_menu(client, callback):
 
 @app.on_callback_query(filters.regex(r"^act_"))
 async def project_actions(client, callback):
-    # FIXED: Handling names with underscores correctly
     try:
-        parts = callback.data.split("_", 2) # Limit split to 2
-        action = parts[1]
-        proj_name = parts[2]
-    except IndexError:
-        return await callback.answer("Error parsing data", show_alert=True)
+        parts = callback.data.split("_", 2)
+        action, proj_name = parts[1], parts[2]
+    except: return
 
     user_id = callback.from_user.id
-    proj_id = f"{user_id}_{proj_name}"
-    
     doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
-    
-    # Debugging print (Optional, remove in production)
-    print(f"User: {user_id}, Action: {action}, Project: {proj_name}, Found: {doc is not None}")
-
-    if not doc: 
-        return await callback.answer("❌ Project Not Found in Database!", show_alert=True)
+    if not doc: return await callback.answer("Project Not Found!", show_alert=True)
 
     if action == "stop":
-        await stop_project_process(proj_id)
+        await stop_project_process(f"{user_id}_{proj_name}")
         await projects_col.update_one({"_id": doc["_id"]}, {"$set": {"status": "Stopped"}})
         await callback.answer("Stopped.")
         await list_projects(client, callback)
@@ -313,12 +305,12 @@ async def project_actions(client, callback):
         await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
 
     elif action == "restart":
-        await stop_project_process(proj_id)
+        await stop_project_process(f"{user_id}_{proj_name}")
         await callback.message.edit_text("♻️ Restarting...")
         await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
 
     elif action == "delete":
-        await stop_project_process(proj_id)
+        await stop_project_process(f"{user_id}_{proj_name}")
         await projects_col.delete_one({"_id": doc["_id"]})
         shutil.rmtree(doc["path"], ignore_errors=True)
         await callback.answer("Deleted.")
@@ -327,19 +319,24 @@ async def project_actions(client, callback):
     elif action == "update":
         USER_STATE[user_id] = {"step": "update_files", "name": proj_name}
         await callback.message.edit_text(
-            f"📤 **Update Mode: {proj_name}**\n\n"
-            "Send new files here.\n"
-            "Click **Back** to cancel.",
+            f"📤 **Update Mode: {proj_name}**\nSend new files. Files are auto-saved to DB.\nClick Back to cancel.",
              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]])
         )
 
-# ================= NAVIGATION =================
+# ================= NAVIGATION & STARTUP =================
 @app.on_callback_query(filters.regex("main_menu"))
 async def back_main(client, callback):
-    if callback.from_user.id in USER_STATE:
-        del USER_STATE[callback.from_user.id]
+    if callback.from_user.id in USER_STATE: del USER_STATE[callback.from_user.id]
     await callback.message.edit_text("🏠 **Main Menu**", reply_markup=get_main_menu(callback.from_user.id))
 
+async def main():
+    print("Master Bot Starting...")
+    await app.start()
+    # جیسے ہی بوٹ سٹارٹ ہوگا، یہ پچھلے پروجیکٹس کو ریسٹور کرے گا
+    await restore_all_projects()
+    print("Master Bot is IDLE...")
+    await asyncio.Event().wait()
+
 if __name__ == "__main__":
-    print("Master Bot Started...")
-    app.run()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
