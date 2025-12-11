@@ -23,6 +23,7 @@ MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rl
 OWNER_IDS = [8167904992, 7134046678] 
 
 # ================= DATABASE SETUP =================
+#
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["master_bot_db"]
 users_col = db["authorized_users"]
