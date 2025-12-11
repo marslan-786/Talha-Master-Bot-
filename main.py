@@ -23,7 +23,6 @@ MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rl
 OWNER_IDS = [8167904992, 7134046678] 
 
 # ================= DATABASE SETUP =================
-#
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["master_bot_db"]
 users_col = db["authorized_users"]
@@ -67,34 +66,41 @@ async def stop_project_process(project_id):
             logging.error(f"Error killing process: {e}")
         del ACTIVE_PROCESSES[project_id]
 
-# ================= AUTO-RESTORE SYSTEM (NEW) =================
-# یہ فنکشن بوٹ اسٹارٹ ہوتے ہی چلے گا اور ڈیٹا بیس سے فائلیں واپس لائے گا
+# ================= AUTO-RESTORE SYSTEM (FIXED) =================
 
 async def restore_all_projects():
-    print("🔄 Checking for projects to restore...")
+    print("🔄 SYSTEM: Checking Database for saved bots...")
+    
+    # صرف ان کو اٹھائیں جو 'Running' تھے
     async for project in projects_col.find({"status": "Running"}):
         user_id = project["user_id"]
         proj_name = project["name"]
         base_path = f"./deployments/{user_id}/{proj_name}"
         
-        # اگر فولڈر نہیں ہے (مطلب ریلوے نے اڑا دیا)، تو دوبارہ بنائیں
+        print(f"♻️ Restoring Project: {proj_name}...")
+        
+        # فولڈر دوبارہ بنائیں
         if not os.path.exists(base_path):
-            print(f"♻️ Restoring Files for: {proj_name}")
             os.makedirs(base_path, exist_ok=True)
             
-            # ڈیٹا بیس سے فائلیں نکال کر ڈسک پر لکھیں
-            files_data = project.get("stored_files", {})
-            for fname, fcontent in files_data.items():
-                with open(os.path.join(base_path, fname), "wb") as f:
-                    f.write(fcontent)
+        # فائلیں ڈیٹا بیس سے نکال کر ڈسک پر لکھیں
+        saved_files = project.get("files", []) # New List Format
+        
+        if not saved_files:
+            print(f"⚠️ Warning: No files found in DB for {proj_name}")
+            continue
+
+        for file_obj in saved_files:
+            file_name = file_obj["name"]
+            file_content = file_obj["content"]
             
-            # دوبارہ چلائیں
-            await start_process_logic(None, None, user_id, proj_name, silent=True)
-        else:
-            # اگر فولڈر ہے لیکن پروسیس نہیں چل رہا
-            project_id = f"{user_id}_{proj_name}"
-            if project_id not in ACTIVE_PROCESSES:
-                 await start_process_logic(None, None, user_id, proj_name, silent=True)
+            # Write bytes to disk
+            with open(os.path.join(base_path, file_name), "wb") as f:
+                f.write(file_content)
+            print(f"   📄 Restored: {file_name}")
+
+        # پروسیس اسٹارٹ کریں
+        await start_process_logic(None, None, user_id, proj_name, silent=True)
 
 # ================= START & AUTH FLOW =================
 
@@ -106,8 +112,8 @@ async def start_command(client, message):
     if await is_authorized(user_id):
         await message.reply_text(
             f"👋 **Welcome back, {message.from_user.first_name}!**\n\n"
-            "**System Status:** Persistent Storage Enabled ✅\n"
-            "Projects will auto-restore after updates.",
+            "**System Status:** ✅ Auto-Restore Fixed\n"
+            "Files are now safely stored in Database.",
             reply_markup=get_main_menu(user_id)
         )
     else:
@@ -148,7 +154,7 @@ async def deploy_start(client, callback):
     user_id = callback.from_user.id
     USER_STATE[user_id] = {"step": "ask_name"}
     await callback.message.edit_text(
-        "📂 **New Project**\nSend a **Name** (No spaces, e.g., `MusicBot`)", 
+        "📂 **New Project**\nSend a **Name** (e.g., `MusicBot`)", 
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]])
     )
 
@@ -163,9 +169,13 @@ async def handle_text_input(client, message):
             if exist: return await message.reply("❌ Name exists. Try another.")
             
             USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
-            keyboard = ReplyKeyboardMarkup([[KeyboardButton("✅ Done / Start Deploy")]], resize_keyboard=True)
+            # Persistent Keyboard for "Done" button
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton("✅ Done / Start Deploy")]], 
+                resize_keyboard=True
+            )
             await message.reply(
-                f"✅ Project: `{proj_name}`\n**Now send files.**\n(Main file MUST be `main.py`).\nPress Button when done. 👇",
+                f"✅ Project: `{proj_name}`\n**Now send files.**\n(Main file MUST be `main.py`).\nPress Button below when done. 👇",
                 reply_markup=keyboard
             )
 
@@ -185,29 +195,28 @@ async def handle_file_upload(client, message):
         os.makedirs(base_path, exist_ok=True)
         save_path = os.path.join(base_path, file_name)
         
-        # 1. Save to Disk
+        # 1. Save to Disk (Temporary for execution)
         await message.download(save_path)
         
-        # 2. Read Bytes and Save to DB (PERSISTENCE MAGIC)
+        # 2. Read Bytes for DB
         with open(save_path, "rb") as f:
             file_content = f.read()
             
+        # 3. Save to DB (SAFE METHOD - USING ARRAY)
+        # First remove old file with same name if exists (to avoid duplicates)
         await projects_col.update_one(
             {"user_id": user_id, "name": proj_name},
-            {"$set": {f"stored_files.{file_name.replace('.', '_DO_')}" : file_content}}, # Dot replace for mongo key safety
-            upsert=True
+            {"$pull": {"files": {"name": file_name}}}
         )
-        # Note: In Mongo keys, dots are restricted, so we replace '.' with '_DO_' temporarily, 
-        # but simpler logic for now: Just storing binary content mapped to filename is complex in keys.
-        # BETTER APPROACH:
+        # Then push new file
         await projects_col.update_one(
             {"user_id": user_id, "name": proj_name},
-            {"$set": {f"stored_files.{file_name}": file_content}}, 
+            {"$push": {"files": {"name": file_name, "content": file_content}}},
             upsert=True
         )
 
         if data["step"] == "update_files":
-            await message.reply(f"📥 **Updated & Saved to DB:** `{file_name}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart", callback_data=f"act_restart_{proj_name}")]]))
+            await message.reply(f"📥 **Updated & Saved:** `{file_name}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart", callback_data=f"act_restart_{proj_name}")]]))
         else:
             await message.reply(f"📥 **Received:** `{file_name}`")
 
@@ -226,16 +235,23 @@ async def finish_deployment(client, message):
 async def start_process_logic(client, chat_id, user_id, proj_name, silent=False):
     base_path = f"./deployments/{user_id}/{proj_name}"
     
-    # If client/chat_id is None (Auto Restore Mode), we just print logs
+    # Silent mode means auto-restore (no chat messages)
     if not silent and client:
         msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
+    # Check if files exist (Double Check for Restore)
+    if not os.path.exists(os.path.join(base_path, "main.py")):
+        if not silent and client: await msg.edit_text("❌ Error: Files lost/not found.")
+        return
+
+    # Install Requirements
     if os.path.exists(os.path.join(base_path, "requirements.txt")):
         if not silent and client: await msg.edit_text("📥 **Installing Libraries...**")
         install_cmd = f"pip install -r {base_path}/requirements.txt"
         proc = await asyncio.create_subprocess_shell(install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
 
+    # Run Bot
     if not silent and client: await msg.edit_text("🚀 **Launching Bot...**")
     
     log_file = open(f"{base_path}/runtime_error.log", "w")
@@ -244,6 +260,7 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
     project_id = f"{user_id}_{proj_name}"
     ACTIVE_PROCESSES[project_id] = run_proc
     
+    # Status Running
     await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Running", "path": base_path}})
     
     if not silent and client:
@@ -333,8 +350,10 @@ async def back_main(client, callback):
 async def main():
     print("Master Bot Starting...")
     await app.start()
-    # جیسے ہی بوٹ سٹارٹ ہوگا، یہ پچھلے پروجیکٹس کو ریسٹور کرے گا
+    
+    # --- AUTO RESTORE TRIGGER ---
     await restore_all_projects()
+    
     print("Master Bot is IDLE...")
     await asyncio.Event().wait()
 
