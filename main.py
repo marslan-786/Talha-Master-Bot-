@@ -94,9 +94,11 @@ async def monitor_process_output(proc, project_id, log_path, client):
                 try:
                     if project_id in ACTIVE_PROCESSES:
                         chat_id = ACTIVE_PROCESSES[project_id]["chat_id"]
+                        # Extract clean name
+                        clean_name = project_id.split("_", 1)[1]
                         decoded_line = line.decode('utf-8', errors='ignore').strip()
                         if decoded_line:
-                            await client.send_message(chat_id, f"🖥 **{project_id.split('_', 1)[1]}:** `{decoded_line}`")
+                            await client.send_message(chat_id, f"🖥 **{clean_name}:** `{decoded_line}`")
                 except Exception:
                     pass
 
@@ -132,7 +134,7 @@ async def start_command(client, message):
 
     if await is_authorized(user_id):
         await message.reply_text(
-            f"👋 **Welcome back, {message.from_user.first_name}!**\n\n**Status:** ✅ Fixed Name Parsing & Errors",
+            f"👋 **Welcome back, {message.from_user.first_name}!**\n\n**Status:** ✅ Python Fix Applied for Underscores",
             reply_markup=get_main_menu(user_id)
         )
     else:
@@ -172,7 +174,7 @@ async def generate_key(client, callback):
 async def deploy_start(client, callback):
     user_id = callback.from_user.id
     USER_STATE[user_id] = {"step": "ask_name"}
-    await safe_edit(callback.message, "📂 **New Project**\nSend a **Name** (e.g., `MusicBot`)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]]))
+    await safe_edit(callback.message, "📂 **New Project**\nSend a **Name** (e.g., `Group_Otp_Bot`)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]]))
 
 @app.on_message(filters.text & filters.private)
 async def handle_text_input(client, message):
@@ -180,7 +182,7 @@ async def handle_text_input(client, message):
     if user_id in USER_STATE:
         state = USER_STATE[user_id]
         if state["step"] == "ask_name":
-            # 🔥 Strict Name Cleaning
+            # Just replace spaces, allow underscores
             proj_name = message.text.strip().replace(" ", "_")
             
             exist = await projects_col.find_one({"user_id": user_id, "name": proj_name})
@@ -289,9 +291,8 @@ async def list_projects(client, callback):
 
 @app.on_callback_query(filters.regex(r"^p_menu_"))
 async def project_menu(client, callback):
-    # 🔥 Fix 1: Safe Parsing for Names with Underscores
+    # 🔥 Fix 1: Properly Extract Name (Removes prefix ONLY)
     try: 
-        # "p_menu_My_Bot_Name" -> "My_Bot_Name"
         proj_name = callback.data.replace("p_menu_", "")
     except: return
     
@@ -307,7 +308,7 @@ async def project_menu(client, callback):
     
     btns = [
         [InlineKeyboardButton(status_btn_text, callback_data=f"act_toggle_{proj_name}")],
-        [InlineKeyboardButton(log_btn_text, callback_data=f"act_logtoggle_{proj_name}"), InlineKeyboardButton("📥 Download Logs", callback_data=f"act_dl_logs_{proj_name}")],
+        [InlineKeyboardButton(log_btn_text, callback_data=f"act_logtoggle_{proj_name}"), InlineKeyboardButton("📥 Download Logs", callback_data=f"act_dlogs_{proj_name}")],
         [InlineKeyboardButton("♻️ Restart", callback_data=f"act_restart_{proj_name}")],
         [InlineKeyboardButton("📤 Update Files", callback_data=f"act_update_{proj_name}")],
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_delete_{proj_name}")],
@@ -315,15 +316,13 @@ async def project_menu(client, callback):
     ]
     
     status_display = "Running 🟢" if is_running else "Stopped 🔴"
-    # Safe Edit to prevent MessageNotModified Crash
-    await safe_edit(callback.message, f"⚙️ **Manage: {proj_name}**\nStatus: {status_display}", reply_markup=InlineKeyboardMarkup(btns))
+    await safe_edit(callback.message, f"⚙️ **Manage: `{proj_name}`**\nStatus: {status_display}", reply_markup=InlineKeyboardMarkup(btns))
 
 @app.on_callback_query(filters.regex(r"^act_"))
 async def project_actions(client, callback):
-    # 🔥 Fix 2: Safe Split Logic
+    # 🔥 Fix 2: Split by only 2 underscores max to preserve Project Name with underscores
+    # Example: act_toggle_Group_otp_bot -> ['act', 'toggle', 'Group_otp_bot']
     try:
-        # Example: act_toggle_My_Bot_Name
-        # Split into ['act', 'toggle', 'My_Bot_Name']
         parts = callback.data.split("_", 2)
         if len(parts) < 3: return
         action = parts[1]
@@ -352,7 +351,8 @@ async def project_actions(client, callback):
         await callback.answer(f"Logs {'Disabled' if current else 'Enabled'}")
         await project_menu(client, callback)
 
-    elif action == "dl_logs":
+    # Note: 'dlogs' (no underscore) ensures the split logic above works
+    elif action == "dlogs":
         log_path = f"./deployments/{user_id}/{proj_name}/logs.txt"
         if os.path.exists(log_path):
             await client.send_document(callback.message.chat.id, log_path, caption=f"📄 Logs: {proj_name}")
@@ -373,7 +373,7 @@ async def project_actions(client, callback):
 
     elif action == "update":
         USER_STATE[user_id] = {"step": "update_files", "name": proj_name}
-        await safe_edit(callback.message, f"📤 **Update Mode: {proj_name}**\nSend files.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]]))
+        await safe_edit(callback.message, f"📤 **Update Mode: `{proj_name}`**\nSend files.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]]))
 
 @app.on_callback_query(filters.regex("main_menu"))
 async def back_main(client, callback):
