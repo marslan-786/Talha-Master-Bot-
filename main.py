@@ -30,8 +30,9 @@ keys_col = db["access_keys"]
 projects_col = db["projects"]
 
 # ================= GLOBAL VARIABLES =================
-ACTIVE_PROCESSES = {} 
+ACTIVE_PROCESSES = {}  # { "user_proj": { "proc": proc_obj, "chat_id": 123 } }
 USER_STATE = {} 
+LOGGING_FLAGS = {} # { "user_proj": True/False } -> To toggle live logs
 
 logging.basicConfig(level=logging.INFO)
 app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -55,7 +56,8 @@ def get_main_menu(user_id):
 
 async def stop_project_process(project_id):
     if project_id in ACTIVE_PROCESSES:
-        proc = ACTIVE_PROCESSES[project_id]
+        data = ACTIVE_PROCESSES[project_id]
+        proc = data["proc"]
         try:
             proc.terminate()
             try:
@@ -66,12 +68,43 @@ async def stop_project_process(project_id):
             logging.error(f"Error killing process: {e}")
         del ACTIVE_PROCESSES[project_id]
 
-# ================= AUTO-RESTORE SYSTEM (FIXED) =================
+# ================= LIVE LOG MONITORING =================
+
+async def monitor_process_output(proc, project_id, log_path, client):
+    """
+    Reads stdout/stderr line by line.
+    Saves to file AND sends to Telegram if Live Logs are enabled.
+    """
+    # Open file in append mode
+    with open(log_path, "ab") as log_file:
+        while True:
+            # Read line
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            
+            # 1. Write to Log File
+            log_file.write(line)
+            log_file.flush()
+            
+            # 2. Check if Live Logging is ON
+            if LOGGING_FLAGS.get(project_id, False):
+                try:
+                    # Get Chat ID from running process data
+                    if project_id in ACTIVE_PROCESSES:
+                        chat_id = ACTIVE_PROCESSES[project_id]["chat_id"]
+                        decoded_line = line.decode('utf-8', errors='ignore').strip()
+                        if decoded_line:
+                            await client.send_message(chat_id, f"🖥 **{project_id.split('_')[1]}:** `{decoded_line}`")
+                except Exception as e:
+                    print(f"Log Send Error: {e}")
+                    # Don't break loop, just skip sending message
+
+# ================= AUTO-RESTORE SYSTEM =================
 
 async def restore_all_projects():
     print("🔄 SYSTEM: Checking Database for saved bots...")
     
-    # صرف ان کو اٹھائیں جو 'Running' تھے
     async for project in projects_col.find({"status": "Running"}):
         user_id = project["user_id"]
         proj_name = project["name"]
@@ -79,27 +112,21 @@ async def restore_all_projects():
         
         print(f"♻️ Restoring Project: {proj_name}...")
         
-        # فولڈر دوبارہ بنائیں
         if not os.path.exists(base_path):
             os.makedirs(base_path, exist_ok=True)
             
-        # فائلیں ڈیٹا بیس سے نکال کر ڈسک پر لکھیں
-        saved_files = project.get("files", []) # New List Format
+        saved_files = project.get("files", [])
         
         if not saved_files:
-            print(f"⚠️ Warning: No files found in DB for {proj_name}")
             continue
 
         for file_obj in saved_files:
             file_name = file_obj["name"]
             file_content = file_obj["content"]
-            
-            # Write bytes to disk
             with open(os.path.join(base_path, file_name), "wb") as f:
                 f.write(file_content)
-            print(f"   📄 Restored: {file_name}")
 
-        # پروسیس اسٹارٹ کریں
+        # Start Process Silently
         await start_process_logic(None, None, user_id, proj_name, silent=True)
 
 # ================= START & AUTH FLOW =================
@@ -112,8 +139,7 @@ async def start_command(client, message):
     if await is_authorized(user_id):
         await message.reply_text(
             f"👋 **Welcome back, {message.from_user.first_name}!**\n\n"
-            "**System Status:** ✅ Auto-Restore Fixed\n"
-            "Files are now safely stored in Database.",
+            "**New Features:**\n✅ Unified Start/Stop\n✅ Live Logs Toggle\n✅ Download Logs",
             reply_markup=get_main_menu(user_id)
         )
     else:
@@ -169,7 +195,6 @@ async def handle_text_input(client, message):
             if exist: return await message.reply("❌ Name exists. Try another.")
             
             USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
-            # Persistent Keyboard for "Done" button
             keyboard = ReplyKeyboardMarkup(
                 [[KeyboardButton("✅ Done / Start Deploy")]], 
                 resize_keyboard=True
@@ -195,20 +220,15 @@ async def handle_file_upload(client, message):
         os.makedirs(base_path, exist_ok=True)
         save_path = os.path.join(base_path, file_name)
         
-        # 1. Save to Disk (Temporary for execution)
         await message.download(save_path)
         
-        # 2. Read Bytes for DB
         with open(save_path, "rb") as f:
             file_content = f.read()
             
-        # 3. Save to DB (SAFE METHOD - USING ARRAY)
-        # First remove old file with same name if exists (to avoid duplicates)
         await projects_col.update_one(
             {"user_id": user_id, "name": proj_name},
             {"$pull": {"files": {"name": file_name}}}
         )
-        # Then push new file
         await projects_col.update_one(
             {"user_id": user_id, "name": proj_name},
             {"$push": {"files": {"name": file_name, "content": file_content}}},
@@ -232,14 +252,14 @@ async def finish_deployment(client, message):
     del USER_STATE[user_id]
     await start_process_logic(client, message.chat.id, user_id, proj_name)
 
+# ================= PROCESS LOGIC (UPDATED) =================
+
 async def start_process_logic(client, chat_id, user_id, proj_name, silent=False):
     base_path = f"./deployments/{user_id}/{proj_name}"
     
-    # Silent mode means auto-restore (no chat messages)
     if not silent and client:
         msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
-    # Check if files exist (Double Check for Restore)
     if not os.path.exists(os.path.join(base_path, "main.py")):
         if not silent and client: await msg.edit_text("❌ Error: Files lost/not found.")
         return
@@ -251,31 +271,46 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
         proc = await asyncio.create_subprocess_shell(install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
 
-    # Run Bot
+    # Run Bot (with -u for unbuffered stdout)
     if not silent and client: await msg.edit_text("🚀 **Launching Bot...**")
     
-    log_file = open(f"{base_path}/runtime_error.log", "w")
-    run_proc = await asyncio.create_subprocess_exec("python3", "main.py", cwd=base_path, stdout=asyncio.subprocess.PIPE, stderr=log_file)
+    # We merge stderr into stdout for simpler logging
+    run_proc = await asyncio.create_subprocess_exec(
+        "python3", "-u", "main.py", 
+        cwd=base_path, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.STDOUT
+    )
     
     project_id = f"{user_id}_{proj_name}"
-    ACTIVE_PROCESSES[project_id] = run_proc
     
-    # Status Running
+    # Store process AND chat_id for live logging
+    ACTIVE_PROCESSES[project_id] = {
+        "proc": run_proc,
+        "chat_id": chat_id
+    }
+    
+    # Start Monitor Task
+    log_file_path = f"{base_path}/logs.txt"
+    # Clear old logs
+    open(log_file_path, 'w').close()
+    
+    asyncio.create_task(monitor_process_output(run_proc, project_id, log_file_path, app))
+    
     await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Running", "path": base_path}})
     
     if not silent and client:
         await msg.edit_text(f"✅ **{proj_name} is Online!**", reply_markup=get_main_menu(user_id))
     
-    # Crash Monitor
+    # Check if immediate crash
     await asyncio.sleep(5)
     if run_proc.returncode is not None:
-        log_file.close()
         del ACTIVE_PROCESSES[project_id]
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Crashed"}})
         if not silent and client:
-             await client.send_document(chat_id, f"{base_path}/runtime_error.log", caption=f"⚠️ **{proj_name} Crashed!**")
+             await client.send_document(chat_id, log_file_path, caption=f"⚠️ **{proj_name} Crashed!**")
 
-# ================= MANAGEMENT FLOW =================
+# ================= MANAGEMENT FLOW (UPDATED) =================
 
 @app.on_callback_query(filters.regex("manage_projects"))
 async def list_projects(client, callback):
@@ -292,14 +327,38 @@ async def list_projects(client, callback):
 async def project_menu(client, callback):
     try: proj_name = callback.data.split("_", 2)[2]
     except: return
+    
+    user_id = callback.from_user.id
+    project_id = f"{user_id}_{proj_name}"
+    
+    # Check Status from DB
+    doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
+    if not doc: return await callback.answer("Not Found")
+    
+    is_running = doc.get("status") == "Running"
+    
+    # 1. Toggle Button Text
+    status_btn_text = "🛑 Stop" if is_running else "▶️ Start"
+    status_callback = f"act_toggle_{proj_name}" # Unified Callback
+    
+    # 2. Log Toggle Text
+    is_logging = LOGGING_FLAGS.get(project_id, False)
+    log_btn_text = "🔴 Disable Logs" if is_logging else "🟢 Enable Logs"
+    
     btns = [
-        [InlineKeyboardButton("🛑 Stop", callback_data=f"act_stop_{proj_name}"), InlineKeyboardButton("▶️ Start", callback_data=f"act_start_{proj_name}")],
+        [InlineKeyboardButton(status_btn_text, callback_data=status_callback)],
+        [
+            InlineKeyboardButton(log_btn_text, callback_data=f"act_logtoggle_{proj_name}"),
+            InlineKeyboardButton("📥 Download Logs", callback_data=f"act_dl_logs_{proj_name}")
+        ],
         [InlineKeyboardButton("♻️ Restart", callback_data=f"act_restart_{proj_name}")],
         [InlineKeyboardButton("📤 Update Files", callback_data=f"act_update_{proj_name}")],
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_delete_{proj_name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]
     ]
-    await callback.message.edit_text(f"⚙️ **Manage: {proj_name}**", reply_markup=InlineKeyboardMarkup(btns))
+    
+    status_display = "Running 🟢" if is_running else "Stopped 🔴"
+    await callback.message.edit_text(f"⚙️ **Manage: {proj_name}**\nStatus: {status_display}", reply_markup=InlineKeyboardMarkup(btns))
 
 @app.on_callback_query(filters.regex(r"^act_"))
 async def project_actions(client, callback):
@@ -309,26 +368,48 @@ async def project_actions(client, callback):
     except: return
 
     user_id = callback.from_user.id
+    project_id = f"{user_id}_{proj_name}"
     doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
     if not doc: return await callback.answer("Project Not Found!", show_alert=True)
 
-    if action == "stop":
-        await stop_project_process(f"{user_id}_{proj_name}")
-        await projects_col.update_one({"_id": doc["_id"]}, {"$set": {"status": "Stopped"}})
-        await callback.answer("Stopped.")
-        await list_projects(client, callback)
+    # --- UNIFIED TOGGLE (START/STOP) ---
+    if action == "toggle":
+        if doc.get("status") == "Running":
+            # STOP IT
+            await stop_project_process(project_id)
+            await projects_col.update_one({"_id": doc["_id"]}, {"$set": {"status": "Stopped"}})
+            await callback.answer("🛑 Project Stopped")
+        else:
+            # START IT
+            await callback.answer("▶️ Starting...")
+            await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
+        
+        # Refresh Menu
+        await project_menu(client, callback)
 
-    elif action == "start":
-        await callback.message.edit_text("⏳ Starting...")
-        await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
+    # --- LIVE LOG TOGGLE ---
+    elif action == "logtoggle":
+        current = LOGGING_FLAGS.get(project_id, False)
+        LOGGING_FLAGS[project_id] = not current
+        new_status = "Enabled" if not current else "Disabled"
+        await callback.answer(f"Logs {new_status}!")
+        await project_menu(client, callback)
+
+    # --- DOWNLOAD LOGS ---
+    elif action == "dl_logs":
+        log_path = f"./deployments/{user_id}/{proj_name}/logs.txt"
+        if os.path.exists(log_path):
+            await client.send_document(callback.message.chat.id, log_path, caption=f"📄 Logs: {proj_name}")
+        else:
+            await callback.answer("❌ No logs found.", show_alert=True)
 
     elif action == "restart":
-        await stop_project_process(f"{user_id}_{proj_name}")
+        await stop_project_process(project_id)
         await callback.message.edit_text("♻️ Restarting...")
         await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
 
     elif action == "delete":
-        await stop_project_process(f"{user_id}_{proj_name}")
+        await stop_project_process(project_id)
         await projects_col.delete_one({"_id": doc["_id"]})
         shutil.rmtree(doc["path"], ignore_errors=True)
         await callback.answer("Deleted.")
