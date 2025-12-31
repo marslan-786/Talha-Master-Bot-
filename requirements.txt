@@ -1,7 +1,9 @@
 pyrogram
 tgcrypto
-python-dotenv
 motor
-dnspython
-aiofiles
 psutil
+fastapi
+uvicorn
+jinja2
+python-multipart
+aiofiles

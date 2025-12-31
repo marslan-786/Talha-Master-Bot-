@@ -4,6 +4,8 @@ import asyncio
 import logging
 import uuid
 import shutil
+import psutil
+import signal
 from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardMarkup, 
@@ -14,12 +16,19 @@ from pyrogram.types import (
 )
 from pyrogram.errors import MessageNotModified
 from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from uvicorn import Config, Server
 
 # ================= CONFIGURATION =================
 API_ID = 94575
 API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2"
 BOT_TOKEN = "8505785410:AAGiDN3FuECbg_K6N_qtjK7OjXh1YYPy5fk"
 MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
+
+# Railway Port Logic
+PORT = int(os.environ.get("PORT", 8080))
 
 OWNER_IDS = [8167904992, 7134046678] 
 
@@ -36,7 +45,11 @@ USER_STATE = {}
 LOGGING_FLAGS = {} 
 
 logging.basicConfig(level=logging.INFO)
-app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot_app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# FastAPI Setup for Web View
+web_app = FastAPI()
+templates = Jinja2Templates(directory="templates") # We will handle inline templates for simplicity if needed, but creates logic below
 
 # ================= HELPER FUNCTIONS =================
 
@@ -69,14 +82,52 @@ async def stop_project_process(project_id):
             logging.error(f"Error killing process: {e}")
         del ACTIVE_PROCESSES[project_id]
 
-# 🔥 Safe Edit Function (To fix MessageNotModified Error)
 async def safe_edit(message, text, reply_markup=None):
     try:
         await message.edit_text(text, reply_markup=reply_markup)
     except MessageNotModified:
-        pass # Ignore if content is same
+        pass 
     except Exception as e:
         logging.error(f"Edit Error: {e}")
+
+# ================= RESOURCE PROTECTION (RAM LIMIT) =================
+
+async def resource_monitor():
+    """Checks RAM usage of all child bots every 10 seconds. Kills if > 1GB."""
+    while True:
+        await asyncio.sleep(10)
+        for project_id in list(ACTIVE_PROCESSES.keys()):
+            try:
+                if project_id not in ACTIVE_PROCESSES: continue
+                
+                proc_data = ACTIVE_PROCESSES[project_id]
+                pid = proc_data["proc"].pid
+                chat_id = proc_data["chat_id"]
+                
+                try:
+                    process = psutil.Process(pid)
+                    # Get Memory in Bytes
+                    mem_info = process.memory_info()
+                    mem_usage_mb = mem_info.rss / (1024 * 1024)
+                    
+                    # LIMIT: 1024 MB (1GB)
+                    if mem_usage_mb > 1024:
+                        clean_name = project_id.split("_", 1)[1] if "_" in project_id else project_id
+                        await bot_app.send_message(
+                            chat_id, 
+                            f"⚠️ **CRITICAL WARNING:** Your bot `{clean_name}` was using **{int(mem_usage_mb)}MB RAM** (Limit: 1GB).\n\n🛑 **It has been stopped to prevent system crash.**\nPlease optimize your code."
+                        )
+                        await stop_project_process(project_id)
+                        # Database update
+                        user_id = int(project_id.split("_")[0])
+                        p_name = project_id.split("_", 1)[1]
+                        await projects_col.update_one({"user_id": user_id, "name": p_name}, {"$set": {"status": "Crashed (RAM Limit)"}})
+                        
+                except psutil.NoSuchProcess:
+                    # Process already died
+                    pass
+            except Exception as e:
+                logging.error(f"Monitor Error: {e}")
 
 # ================= LIVE LOG MONITORING =================
 
@@ -94,7 +145,6 @@ async def monitor_process_output(proc, project_id, log_path, client):
                 try:
                     if project_id in ACTIVE_PROCESSES:
                         chat_id = ACTIVE_PROCESSES[project_id]["chat_id"]
-                        # Extract clean name
                         clean_name = project_id.split("_", 1)[1]
                         decoded_line = line.decode('utf-8', errors='ignore').strip()
                         if decoded_line:
@@ -111,8 +161,6 @@ async def restore_all_projects():
         proj_name = project["name"]
         base_path = f"./deployments/{user_id}/{proj_name}"
         
-        print(f"♻️ Restoring Project: {proj_name}...")
-        
         if not os.path.exists(base_path):
             os.makedirs(base_path, exist_ok=True)
             
@@ -125,16 +173,120 @@ async def restore_all_projects():
 
         await start_process_logic(None, None, user_id, proj_name, silent=True)
 
-# ================= START & AUTH FLOW =================
+# ================= WEB DASHBOARD (HTML GENERATION) =================
 
-@app.on_message(filters.command("start") & filters.private)
+def get_html_base(content):
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Master Bot Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+            body {{ background-color: #f8f9fa; }}
+            .card {{ margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .header {{ background: #0d6efd; color: white; padding: 20px; margin-bottom: 30px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header text-center">
+            <h1>🤖 Master Bot Admin Panel</h1>
+        </div>
+        <div class="container">
+            {content}
+        </div>
+    </body>
+    </html>
+    """
+
+@web_app.get("/", response_class=HTMLResponse)
+async def home():
+    users = await users_col.find().to_list(length=1000)
+    user_list_html = ""
+    for u in users:
+        user_id = u['user_id']
+        project_count = await projects_col.count_documents({"user_id": user_id})
+        user_list_html += f"""
+        <div class="col-md-4">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">👤 User ID: {user_id}</h5>
+                    <p>Projects: <strong>{project_count}</strong></p>
+                    <p>Joined: {u.get('joined_at', 'N/A')}</p>
+                    <a href="/user/{user_id}" class="btn btn-primary w-100">View Projects</a>
+                </div>
+            </div>
+        </div>
+        """
+    return get_html_base(f'<div class="row">{user_list_html}</div>')
+
+@web_app.get("/user/{user_id}", response_class=HTMLResponse)
+async def view_user(user_id: int):
+    projects = await projects_col.find({"user_id": user_id}).to_list(length=1000)
+    proj_html = f'<h3>📂 Projects for User: {user_id}</h3><a href="/" class="btn btn-secondary mb-3">⬅️ Back to Users</a><div class="row">'
+    
+    for p in projects:
+        status = "🟢 Running" if p.get("status") == "Running" else "🔴 Stopped"
+        if "Crashed" in p.get("status", ""): status = "⚠️ Crashed"
+        
+        p_name = p['name']
+        proj_html += f"""
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">{p_name}</h5>
+                    <p>Status: <strong>{status}</strong></p>
+                    <div class="d-grid gap-2">
+                        <a href="/action/{user_id}/{p_name}/stop" class="btn btn-warning btn-sm">🛑 Stop</a>
+                        <a href="/action/{user_id}/{p_name}/start" class="btn btn-success btn-sm">▶️ Start</a>
+                        <a href="/action/{user_id}/{p_name}/download" class="btn btn-info btn-sm">📥 Download Files</a>
+                        <a href="/action/{user_id}/{p_name}/delete" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure?')">🗑️ Delete</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+    return get_html_base(f'{proj_html}</div>')
+
+@web_app.get("/action/{user_id}/{p_name}/{action}")
+async def project_action(user_id: int, p_name: str, action: str):
+    project_id = f"{user_id}_{p_name}"
+    doc = await projects_col.find_one({"user_id": user_id, "name": p_name})
+    
+    if not doc: return HTMLResponse("Project not found")
+    
+    base_path = f"./deployments/{user_id}/{p_name}"
+
+    if action == "stop":
+        await stop_project_process(project_id)
+        await projects_col.update_one({"_id": doc["_id"]}, {"$set": {"status": "Stopped"}})
+    
+    elif action == "start":
+        await start_process_logic(None, None, user_id, p_name, silent=True) # Silent start (no TG msg)
+    
+    elif action == "delete":
+        await stop_project_process(project_id)
+        await projects_col.delete_one({"_id": doc["_id"]})
+        shutil.rmtree(doc["path"], ignore_errors=True)
+    
+    elif action == "download":
+        zip_name = f"{p_name}_files"
+        shutil.make_archive(zip_name, 'zip', base_path)
+        return FileResponse(f"{zip_name}.zip", filename=f"{p_name}.zip")
+
+    return RedirectResponse(url=f"/user/{user_id}")
+
+# ================= TELEGRAM BOT LOGIC =================
+
+@bot_app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     user_id = message.from_user.id
     if user_id in USER_STATE: del USER_STATE[user_id]
 
     if await is_authorized(user_id):
         await message.reply_text(
-            f"👋 **Welcome back, {message.from_user.first_name}!**\n\n**Status:** ✅ Python Fix Applied for Underscores",
+            f"👋 **Welcome back, {message.from_user.first_name}!**\n\n✅ **System Online**\n🛡️ **RAM Limit:** 1GB per bot enforced.",
             reply_markup=get_main_menu(user_id)
         )
     else:
@@ -150,9 +302,7 @@ async def start_command(client, message):
         else:
             await message.reply_text("🔒 **Access Denied**\nUse `/start <key>` to login.")
 
-# ================= OWNER PANEL =================
-
-@app.on_callback_query(filters.regex("owner_panel"))
+@bot_app.on_callback_query(filters.regex("owner_panel"))
 async def owner_panel_cb(client, callback):
     if callback.from_user.id not in OWNER_IDS:
         return await callback.answer("Admins only!", show_alert=True)
@@ -162,59 +312,49 @@ async def owner_panel_cb(client, callback):
     ]
     await safe_edit(callback.message, "👑 **Owner Panel**", reply_markup=InlineKeyboardMarkup(btns))
 
-@app.on_callback_query(filters.regex("gen_key"))
+@bot_app.on_callback_query(filters.regex("gen_key"))
 async def generate_key(client, callback):
     new_key = str(uuid.uuid4())[:8]
     await keys_col.insert_one({"key": new_key, "status": "active", "created_by": callback.from_user.id})
     await safe_edit(callback.message, f"✅ Key: `{new_key}`\nCommand: `/start {new_key}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
 
-# ================= DEPLOYMENT FLOW =================
-
-@app.on_callback_query(filters.regex("deploy_new"))
+@bot_app.on_callback_query(filters.regex("deploy_new"))
 async def deploy_start(client, callback):
     user_id = callback.from_user.id
     USER_STATE[user_id] = {"step": "ask_name"}
     await safe_edit(callback.message, "📂 **New Project**\nSend a **Name** (e.g., `Group_Otp_Bot`)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]]))
 
-@app.on_message(filters.text & filters.private)
+@bot_app.on_message(filters.text & filters.private)
 async def handle_text_input(client, message):
     user_id = message.from_user.id
     if user_id in USER_STATE:
         state = USER_STATE[user_id]
         if state["step"] == "ask_name":
-            # Just replace spaces, allow underscores
             proj_name = message.text.strip().replace(" ", "_")
-            
             exist = await projects_col.find_one({"user_id": user_id, "name": proj_name})
             if exist: return await message.reply("❌ Name exists. Try another.")
-            
             USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
             keyboard = ReplyKeyboardMarkup([[KeyboardButton("✅ Done / Start Deploy")]], resize_keyboard=True)
             await message.reply(f"✅ Project: `{proj_name}`\n**Now send files.**", reply_markup=keyboard)
-
         elif message.text == "✅ Done / Start Deploy":
             if state["step"] == "wait_files":
                 await finish_deployment(client, message)
 
-@app.on_message(filters.document & filters.private)
+@bot_app.on_message(filters.document & filters.private)
 async def handle_file_upload(client, message):
     user_id = message.from_user.id
     if user_id in USER_STATE and USER_STATE[user_id]["step"] in ["wait_files", "update_files"]:
         data = USER_STATE[user_id]
         proj_name = data["name"]
         file_name = message.document.file_name
-        
         base_path = f"./deployments/{user_id}/{proj_name}"
         os.makedirs(base_path, exist_ok=True)
         save_path = os.path.join(base_path, file_name)
-        
         await message.download(save_path)
         with open(save_path, "rb") as f:
             file_content = f.read()
-            
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$pull": {"files": {"name": file_name}}})
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$push": {"files": {"name": file_name, "content": file_content}}}, upsert=True)
-
         if data["step"] == "update_files":
             await message.reply(f"📥 **Updated:** `{file_name}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Restart", callback_data=f"act_restart_{proj_name}")]]))
         else:
@@ -224,19 +364,15 @@ async def finish_deployment(client, message):
     user_id = message.from_user.id
     proj_name = USER_STATE[user_id]["name"]
     base_path = f"./deployments/{user_id}/{proj_name}"
-    
     if not os.path.exists(os.path.join(base_path, "main.py")):
         return await message.reply("❌ `main.py` missing!")
-    
     await message.reply("⚙️ **Starting Deployment...**", reply_markup=ReplyKeyboardRemove())
     del USER_STATE[user_id]
     await start_process_logic(client, message.chat.id, user_id, proj_name)
 
 async def start_process_logic(client, chat_id, user_id, proj_name, silent=False):
     base_path = f"./deployments/{user_id}/{proj_name}"
-    
-    if not silent and client:
-        msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
+    if not silent and client: msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
     if not os.path.exists(os.path.join(base_path, "main.py")):
         if not silent and client: await msg.edit_text("❌ Error: Files lost.")
@@ -258,12 +394,14 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
     )
     
     project_id = f"{user_id}_{proj_name}"
-    ACTIVE_PROCESSES[project_id] = {"proc": run_proc, "chat_id": chat_id}
+    # NOTE: Store Chat ID only if started via TG, otherwise use User ID to find chat if needed
+    p_chat_id = chat_id if chat_id else user_id # Fallback
+    ACTIVE_PROCESSES[project_id] = {"proc": run_proc, "chat_id": p_chat_id}
     
     log_file_path = f"{base_path}/logs.txt"
     open(log_file_path, 'w').close()
     
-    asyncio.create_task(monitor_process_output(run_proc, project_id, log_file_path, app))
+    asyncio.create_task(monitor_process_output(run_proc, project_id, log_file_path, bot_app))
     await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Running", "path": base_path}})
     
     if not silent and client:
@@ -271,14 +409,12 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
     
     await asyncio.sleep(5)
     if run_proc.returncode is not None:
-        del ACTIVE_PROCESSES[project_id]
+        if project_id in ACTIVE_PROCESSES: del ACTIVE_PROCESSES[project_id]
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Crashed"}})
         if not silent and client:
-             await client.send_document(chat_id, log_file_path, caption=f"⚠️ **{proj_name} Crashed!**")
+             await client.send_document(p_chat_id, log_file_path, caption=f"⚠️ **{proj_name} Crashed!**")
 
-# ================= MANAGEMENT FLOW (FIXED) =================
-
-@app.on_callback_query(filters.regex("manage_projects"))
+@bot_app.on_callback_query(filters.regex("manage_projects"))
 async def list_projects(client, callback):
     user_id = callback.from_user.id
     projects = projects_col.find({"user_id": user_id})
@@ -289,23 +425,17 @@ async def list_projects(client, callback):
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
     await safe_edit(callback.message, "📂 **Your Projects**", reply_markup=InlineKeyboardMarkup(btns))
 
-@app.on_callback_query(filters.regex(r"^p_menu_"))
+@bot_app.on_callback_query(filters.regex(r"^p_menu_"))
 async def project_menu(client, callback):
-    # 🔥 Fix 1: Properly Extract Name (Removes prefix ONLY)
-    try: 
-        proj_name = callback.data.replace("p_menu_", "")
+    try: proj_name = callback.data.replace("p_menu_", "")
     except: return
-    
     user_id = callback.from_user.id
     project_id = f"{user_id}_{proj_name}"
-    
     doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
     if not doc: return await callback.answer("Project Not Found", show_alert=True)
-    
     is_running = doc.get("status") == "Running"
     status_btn_text = "🛑 Stop" if is_running else "▶️ Start"
     log_btn_text = "🔴 Disable Logs" if LOGGING_FLAGS.get(project_id, False) else "🟢 Enable Logs"
-    
     btns = [
         [InlineKeyboardButton(status_btn_text, callback_data=f"act_toggle_{proj_name}")],
         [InlineKeyboardButton(log_btn_text, callback_data=f"act_logtoggle_{proj_name}"), InlineKeyboardButton("📥 Download Logs", callback_data=f"act_dlogs_{proj_name}")],
@@ -314,27 +444,21 @@ async def project_menu(client, callback):
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_delete_{proj_name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]
     ]
-    
     status_display = "Running 🟢" if is_running else "Stopped 🔴"
     await safe_edit(callback.message, f"⚙️ **Manage: `{proj_name}`**\nStatus: {status_display}", reply_markup=InlineKeyboardMarkup(btns))
 
-@app.on_callback_query(filters.regex(r"^act_"))
+@bot_app.on_callback_query(filters.regex(r"^act_"))
 async def project_actions(client, callback):
-    # 🔥 Fix 2: Split by only 2 underscores max to preserve Project Name with underscores
-    # Example: act_toggle_Group_otp_bot -> ['act', 'toggle', 'Group_otp_bot']
     try:
         parts = callback.data.split("_", 2)
         if len(parts) < 3: return
         action = parts[1]
         proj_name = parts[2]
     except: return
-
     user_id = callback.from_user.id
     project_id = f"{user_id}_{proj_name}"
     doc = await projects_col.find_one({"user_id": user_id, "name": proj_name})
-    
     if not doc: return await callback.answer("Project Not Found!", show_alert=True)
-
     if action == "toggle":
         if doc.get("status") == "Running":
             await stop_project_process(project_id)
@@ -344,49 +468,62 @@ async def project_actions(client, callback):
             await callback.answer("▶️ Starting...")
             await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
         await project_menu(client, callback)
-
     elif action == "logtoggle":
         current = LOGGING_FLAGS.get(project_id, False)
         LOGGING_FLAGS[project_id] = not current
         await callback.answer(f"Logs {'Disabled' if current else 'Enabled'}")
         await project_menu(client, callback)
-
-    # Note: 'dlogs' (no underscore) ensures the split logic above works
     elif action == "dlogs":
         log_path = f"./deployments/{user_id}/{proj_name}/logs.txt"
-        if os.path.exists(log_path):
-            await client.send_document(callback.message.chat.id, log_path, caption=f"📄 Logs: {proj_name}")
-        else:
-            await callback.answer("❌ No logs found.", show_alert=True)
-
+        if os.path.exists(log_path): await client.send_document(callback.message.chat.id, log_path, caption=f"📄 Logs: {proj_name}")
+        else: await callback.answer("❌ No logs found.", show_alert=True)
     elif action == "restart":
         await stop_project_process(project_id)
         await safe_edit(callback.message, "♻️ Restarting...")
         await start_process_logic(client, callback.message.chat.id, user_id, proj_name)
-
     elif action == "delete":
         await stop_project_process(project_id)
         await projects_col.delete_one({"_id": doc["_id"]})
         shutil.rmtree(doc["path"], ignore_errors=True)
         await callback.answer("Deleted.")
         await list_projects(client, callback)
-
     elif action == "update":
         USER_STATE[user_id] = {"step": "update_files", "name": proj_name}
         await safe_edit(callback.message, f"📤 **Update Mode: `{proj_name}`**\nSend files.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]]))
 
-@app.on_callback_query(filters.regex("main_menu"))
+@bot_app.on_callback_query(filters.regex("main_menu"))
 async def back_main(client, callback):
     if callback.from_user.id in USER_STATE: del USER_STATE[callback.from_user.id]
     await safe_edit(callback.message, "🏠 **Main Menu**", reply_markup=get_main_menu(callback.from_user.id))
 
+# ================= MAIN EXECUTION =================
+
 async def main():
-    print("Master Bot Starting...")
-    await app.start()
+    print("🚀 SYSTEM STARTUP: Initializing Master Bot...")
+    
+    # 1. Start Telegram Client
+    await bot_app.start()
+    print("✅ Telegram Bot Connected.")
+    
+    # 2. Restore Old Processes
     await restore_all_projects()
-    print("Master Bot is IDLE...")
-    await asyncio.Event().wait()
+    
+    # 3. Start Resource Monitor (Protects against 1GB RAM overflow)
+    asyncio.create_task(resource_monitor())
+    print("🛡️ Resource Monitor Active (Limit: 1GB/bot)")
+
+    # 4. Start Web Server (FastAPI + Uvicorn) for Railway Port
+    config = Config(app=web_app, host="0.0.0.0", port=PORT, log_level="info")
+    server = Server(config)
+    
+    print(f"🌍 Web Dashboard Running on Port: {PORT}")
+    
+    # Run server alongside the existing loop
+    await server.serve()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
