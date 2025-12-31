@@ -45,11 +45,13 @@ USER_STATE = {}
 LOGGING_FLAGS = {} 
 
 logging.basicConfig(level=logging.INFO)
+
+# 🔥 Telegram Bot Client (Renamed to bot_app to avoid conflict)
 bot_app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# FastAPI Setup for Web View
-web_app = FastAPI()
-templates = Jinja2Templates(directory="templates") # We will handle inline templates for simplicity if needed, but creates logic below
+# 🔥 FastAPI Web App (Renamed to app for Railway Auto-Detect)
+app = FastAPI()
+templates = Jinja2Templates(directory="templates") 
 
 # ================= HELPER FUNCTIONS =================
 
@@ -200,7 +202,7 @@ def get_html_base(content):
     </html>
     """
 
-@web_app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 async def home():
     users = await users_col.find().to_list(length=1000)
     user_list_html = ""
@@ -221,7 +223,7 @@ async def home():
         """
     return get_html_base(f'<div class="row">{user_list_html}</div>')
 
-@web_app.get("/user/{user_id}", response_class=HTMLResponse)
+@app.get("/user/{user_id}", response_class=HTMLResponse)
 async def view_user(user_id: int):
     projects = await projects_col.find({"user_id": user_id}).to_list(length=1000)
     proj_html = f'<h3>📂 Projects for User: {user_id}</h3><a href="/" class="btn btn-secondary mb-3">⬅️ Back to Users</a><div class="row">'
@@ -249,7 +251,7 @@ async def view_user(user_id: int):
         """
     return get_html_base(f'{proj_html}</div>')
 
-@web_app.get("/action/{user_id}/{p_name}/{action}")
+@app.get("/action/{user_id}/{p_name}/{action}")
 async def project_action(user_id: int, p_name: str, action: str):
     project_id = f"{user_id}_{p_name}"
     doc = await projects_col.find_one({"user_id": user_id, "name": p_name})
@@ -394,8 +396,7 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
     )
     
     project_id = f"{user_id}_{proj_name}"
-    # NOTE: Store Chat ID only if started via TG, otherwise use User ID to find chat if needed
-    p_chat_id = chat_id if chat_id else user_id # Fallback
+    p_chat_id = chat_id if chat_id else user_id 
     ACTIVE_PROCESSES[project_id] = {"proc": run_proc, "chat_id": p_chat_id}
     
     log_file_path = f"{base_path}/logs.txt"
@@ -513,7 +514,8 @@ async def main():
     print("🛡️ Resource Monitor Active (Limit: 1GB/bot)")
 
     # 4. Start Web Server (FastAPI + Uvicorn) for Railway Port
-    config = Config(app=web_app, host="0.0.0.0", port=PORT, log_level="info")
+    # 🔥 FIX: Changed app=web_app to app=app
+    config = Config(app=app, host="0.0.0.0", port=PORT, log_level="info")
     server = Server(config)
     
     print(f"🌍 Web Dashboard Running on Port: {PORT}")
