@@ -23,12 +23,11 @@ API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2"
 BOT_TOKEN = "8505785410:AAGiDN3FuECbg_K6N_qtjK7OjXh1YYPy5fk"
 MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
 
-# Railway Port Logic
 PORT = int(os.environ.get("PORT", 8080))
 
 # 🔥 ROLES SETUP
-MAIN_OWNER_ID = 8167904992  # صرف اس کے پاس فل کنٹرول ہوگا
-OWNER_IDS = [8167904992, 7134046678] # باقی ایڈمنز
+MAIN_OWNER_ID = 8167904992  
+OWNER_IDS = [8167904992, 7134046678] 
 
 # ========= DATABASE SETUP =========
 mongo_client = AsyncIOMotorClient(MONGO_URL)
@@ -44,19 +43,17 @@ LOGGING_FLAGS = {}
 
 logging.basicConfig(level=logging.INFO)
 
-# 🔥 Telegram Bot Client
 bot_app = Client("MasterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ================= HELPER FUNCTIONS =================
 
 async def is_authorized(user_id):
-    if user_id in OWNER_IDS:
-        return True
+    if user_id in OWNER_IDS: return True
     user = await users_col.find_one({"user_id": user_id})
+    if user and user.get("is_blocked", False): return False # Blocked User Check
     return True if user else False
 
 async def update_user_info(user):
-    """Saves User Name/Username for the List View"""
     await users_col.update_one(
         {"user_id": user.id},
         {"$set": {
@@ -82,21 +79,15 @@ async def stop_project_process(project_id):
         proc = data["proc"]
         try:
             proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-        except Exception as e:
-            logging.error(f"Error killing process: {e}")
+            try: await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except: proc.kill()
+        except: pass
         del ACTIVE_PROCESSES[project_id]
 
 async def safe_edit(message, text, reply_markup=None):
-    try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except MessageNotModified:
-        pass 
-    except Exception as e:
-        logging.error(f"Edit Error: {e}")
+    try: await message.edit_text(text, reply_markup=reply_markup)
+    except MessageNotModified: pass 
+    except: pass
 
 async def ensure_files_exist(user_id, proj_name):
     base_path = f"./deployments/{user_id}/{proj_name}"
@@ -110,11 +101,8 @@ async def ensure_files_exist(user_id, proj_name):
             return True
     return os.path.exists(base_path)
 
-# ================= DUMMY WEB SERVER (FOR RAILWAY) =================
-# یہ صرف اس لیے ہے تاکہ ریلوے کنٹینر کو بند نہ کرے۔ یہ بہت ہلکا ہے۔
-async def health_check(request):
-    return web.Response(text="Bot is Running Successfully")
-
+# ================= DUMMY SERVER =================
+async def health_check(request): return web.Response(text="Running")
 async def start_dummy_server():
     app = web.Application()
     app.router.add_get("/", health_check)
@@ -122,10 +110,8 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌍 Dummy Web Server running on port {PORT}")
 
-# ================= RESOURCE PROTECTION =================
-
+# ================= RESOURCE MONITOR =================
 async def resource_monitor():
     while True:
         await asyncio.sleep(10)
@@ -135,23 +121,14 @@ async def resource_monitor():
                 proc_data = ACTIVE_PROCESSES[project_id]
                 try:
                     process = psutil.Process(proc_data["proc"].pid)
-                    mem_usage_mb = process.memory_info().rss / (1024 * 1024)
-                    
-                    if mem_usage_mb > 1024: # 1GB Limit
-                        await bot_app.send_message(
-                            proc_data["chat_id"], 
-                            f"⚠️ **RAM Limit Exceeded!** Bot stopped."
-                        )
+                    if (process.memory_info().rss / (1024 * 1024)) > 1024:
+                        await bot_app.send_message(proc_data["chat_id"], "⚠️ **RAM Limit (1GB) Exceeded! Bot Stopped.**")
                         await stop_project_process(project_id)
-                        user_id = int(project_id.split("_")[0])
+                        u_id = int(project_id.split("_")[0])
                         p_name = project_id.split("_", 1)[1]
-                        await projects_col.update_one({"user_id": user_id, "name": p_name}, {"$set": {"status": "Crashed"}})
-                except psutil.NoSuchProcess:
-                    pass
-            except Exception:
-                pass
-
-# ================= LIVE LOGS =================
+                        await projects_col.update_one({"user_id": u_id, "name": p_name}, {"$set": {"status": "Crashed"}})
+                except: pass
+            except: pass
 
 async def monitor_process_output(proc, project_id, log_path, client):
     with open(log_path, "ab") as log_file:
@@ -163,48 +140,38 @@ async def monitor_process_output(proc, project_id, log_path, client):
             if LOGGING_FLAGS.get(project_id, False):
                 try:
                     if project_id in ACTIVE_PROCESSES:
-                        chat_id = ACTIVE_PROCESSES[project_id]["chat_id"]
-                        clean_name = project_id.split("_", 1)[1]
                         decoded = line.decode('utf-8', errors='ignore').strip()
-                        if decoded: await client.send_message(chat_id, f"🖥 **{clean_name}:** `{decoded}`")
+                        if decoded: await client.send_message(ACTIVE_PROCESSES[project_id]["chat_id"], f"🖥 **Log:** `{decoded}`")
                 except: pass
 
-# ================= RESTORE SYSTEM =================
+# ================= RESTORE & START =================
 
 async def restore_all_projects():
     print("🔄 Restoring Projects...")
     async for project in projects_col.find({"status": "Running"}):
-        user_id = project["user_id"]
-        proj_name = project["name"]
-        await ensure_files_exist(user_id, proj_name)
-        await start_process_logic(None, None, user_id, proj_name, silent=True)
-
-# ================= DEPLOYMENT LOGIC =================
+        await ensure_files_exist(project["user_id"], project["name"])
+        await start_process_logic(None, None, project["user_id"], project["name"], silent=True)
 
 async def start_process_logic(client, chat_id, user_id, proj_name, silent=False):
     base_path = f"./deployments/{user_id}/{proj_name}"
     if not silent and client: msg = await client.send_message(chat_id, f"⏳ **Initializing {proj_name}...**")
     
     if not os.path.exists(os.path.join(base_path, "main.py")):
-        if not silent and client: await msg.edit_text("❌ Error: Files lost.")
+        if not silent and client: await msg.edit_text("❌ Files missing.")
         return
 
     if os.path.exists(os.path.join(base_path, "requirements.txt")):
-        if not silent and client: await msg.edit_text("📥 **Installing Libraries...**")
-        install_cmd = f"pip install -r {base_path}/requirements.txt"
-        proc = await asyncio.create_subprocess_shell(install_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc.communicate()
+        if not silent and client: await msg.edit_text("📥 **Installing Libs...**")
+        await (await asyncio.create_subprocess_shell(f"pip install -r {base_path}/requirements.txt", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)).communicate()
 
-    if not silent and client: await msg.edit_text("🚀 **Launching Bot...**")
+    if not silent and client: await msg.edit_text("🚀 **Launching...**")
     
     run_proc = await asyncio.create_subprocess_exec("python3", "-u", "main.py", cwd=base_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     project_id = f"{user_id}_{proj_name}"
-    p_chat_id = chat_id if chat_id else user_id 
-    ACTIVE_PROCESSES[project_id] = {"proc": run_proc, "chat_id": p_chat_id}
+    ACTIVE_PROCESSES[project_id] = {"proc": run_proc, "chat_id": chat_id if chat_id else user_id}
     
-    log_file_path = f"{base_path}/logs.txt"
-    open(log_file_path, 'w').close()
-    asyncio.create_task(monitor_process_output(run_proc, project_id, log_file_path, bot_app))
+    open(f"{base_path}/logs.txt", 'w').close()
+    asyncio.create_task(monitor_process_output(run_proc, project_id, f"{base_path}/logs.txt", bot_app))
     
     await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Running", "path": base_path}})
     if not silent and client: await msg.edit_text(f"✅ **{proj_name} is Online!**", reply_markup=get_main_menu(user_id))
@@ -213,9 +180,9 @@ async def start_process_logic(client, chat_id, user_id, proj_name, silent=False)
     if run_proc.returncode is not None:
         if project_id in ACTIVE_PROCESSES: del ACTIVE_PROCESSES[project_id]
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$set": {"status": "Crashed"}})
-        if not silent and client: await client.send_document(p_chat_id, log_file_path, caption=f"⚠️ **{proj_name} Crashed!**")
+        if not silent and client: await client.send_document(chat_id, f"{base_path}/logs.txt", caption=f"⚠️ **{proj_name} Crashed!**")
 
-# ================= USER/ADMIN COMMANDS =================
+# ================= COMMANDS =================
 
 @bot_app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
@@ -231,12 +198,12 @@ async def start_command(client, message):
             key_doc = await keys_col.find_one({"key": token, "status": "active"})
             if key_doc:
                 await keys_col.update_one({"_id": key_doc["_id"]}, {"$set": {"status": "used", "used_by": user_id}})
-                await users_col.insert_one({"user_id": user_id, "first_name": message.from_user.first_name, "username": message.from_user.username, "joined_at": message.date})
+                await users_col.insert_one({"user_id": user_id, "first_name": message.from_user.first_name, "joined_at": message.date, "is_blocked": False})
                 await message.reply_text("✅ **Access Granted!**", reply_markup=get_main_menu(user_id))
-            else:
-                await message.reply_text("❌ **Invalid Token.**")
-        else:
-            await message.reply_text("🔒 **Access Denied**\nUse `/start <key>`")
+            else: await message.reply_text("❌ **Invalid Token.**")
+        else: await message.reply_text("🔒 **Access Denied**")
+
+# ================= OWNER PANEL =================
 
 @bot_app.on_callback_query(filters.regex("owner_panel"))
 async def owner_panel_cb(client, callback):
@@ -244,119 +211,83 @@ async def owner_panel_cb(client, callback):
     if user_id not in OWNER_IDS: return await callback.answer("Admins only!", show_alert=True)
     
     btns = [[InlineKeyboardButton("🔑 Generate Key", callback_data="gen_key")]]
-    
-    # 🔥 Special Button ONLY for Main Owner (992)
     if user_id == MAIN_OWNER_ID:
-        btns.insert(0, [InlineKeyboardButton("👥 Manage Users (Full Control)", callback_data="list_all_users")])
+        btns.insert(0, [InlineKeyboardButton("👥 Authorized Users (Access)", callback_data="list_access_users")])
+        btns.insert(0, [InlineKeyboardButton("📂 All Projects (Full Control)", callback_data="list_all_projects_adm")])
     
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-    await safe_edit(callback.message, "👑 **Owner Panel**\nChoose an option:", reply_markup=InlineKeyboardMarkup(btns))
+    await safe_edit(callback.message, "👑 **Owner Panel**", reply_markup=InlineKeyboardMarkup(btns))
 
 @bot_app.on_callback_query(filters.regex("gen_key"))
 async def generate_key(client, callback):
     new_key = str(uuid.uuid4())[:8]
     await keys_col.insert_one({"key": new_key, "status": "active", "created_by": callback.from_user.id})
-    await safe_edit(callback.message, f"✅ Key: `{new_key}`\nCommand: `/start {new_key}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
+    await safe_edit(callback.message, f"✅ Key: `{new_key}`\n`/start {new_key}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
 
-# ================= ADMIN USER MANAGEMENT =================
+# ================= MANAGE ACCESS USERS (NEW) =================
 
-@bot_app.on_callback_query(filters.regex("list_all_users"))
-async def list_all_users(client, callback):
+@bot_app.on_callback_query(filters.regex("list_access_users"))
+async def list_access_users(client, callback):
     if callback.from_user.id != MAIN_OWNER_ID: return
     
-    users = await users_col.find().to_list(length=100) # List first 100 users
-    if not users: return await callback.answer("No users found.", show_alert=True)
+    users = await users_col.find({"user_id": {"$nin": OWNER_IDS}}).to_list(length=100)
+    if not users: return await callback.answer("No authorized users found.", show_alert=True)
     
     btns = []
     for u in users:
-        fname = u.get("first_name", "Unknown")
-        uid = u["user_id"]
-        btns.append([InlineKeyboardButton(f"👤 {fname} ({uid})", callback_data=f"adm_view_u_{uid}")])
+        status = "🚫" if u.get("is_blocked") else "✅"
+        btns.append([InlineKeyboardButton(f"{status} {u.get('first_name')} ({u['user_id']})", callback_data=f"acc_view_{u['user_id']}")])
     
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="owner_panel")])
-    await safe_edit(callback.message, "👥 **All Users List**\nSelect a user to manage:", reply_markup=InlineKeyboardMarkup(btns))
+    await safe_edit(callback.message, "👥 **Authorized Users**\nSelect to manage:", reply_markup=InlineKeyboardMarkup(btns))
 
-@bot_app.on_callback_query(filters.regex(r"^adm_view_u_"))
-async def admin_view_user(client, callback):
+@bot_app.on_callback_query(filters.regex(r"^acc_view_"))
+async def view_access_user(client, callback):
     if callback.from_user.id != MAIN_OWNER_ID: return
-    target_uid = int(callback.data.split("_")[3])
+    target_id = int(callback.data.split("_")[2])
+    user = await users_col.find_one({"user_id": target_id})
     
-    projects = await projects_col.find({"user_id": target_uid}).to_list(length=50)
+    is_blocked = user.get("is_blocked", False)
+    status_text = "Blocked 🔴" if is_blocked else "Active 🟢"
+    block_btn_text = "🟢 Unblock" if is_blocked else "🔴 Block Access"
+    block_action = "unblock" if is_blocked else "block"
     
-    text = f"👤 **User ID:** `{target_uid}`\n📂 **Total Projects:** {len(projects)}"
+    text = f"👤 **User:** {user.get('first_name')}\n🆔 **ID:** `{target_id}`\n📊 **Status:** {status_text}"
     
-    btns = []
-    for p in projects:
-        status = "🟢" if p.get("status") == "Running" else "🔴"
-        btns.append([InlineKeyboardButton(f"{status} {p['name']}", callback_data=f"adm_p_opts_{target_uid}_{p['name']}")])
-    
-    btns.append([InlineKeyboardButton("🔙 User List", callback_data="list_all_users")])
-    await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(btns))
-
-@bot_app.on_callback_query(filters.regex(r"^adm_p_opts_"))
-async def admin_project_options(client, callback):
-    if callback.from_user.id != MAIN_OWNER_ID: return
-    parts = callback.data.split("_")
-    target_uid = int(parts[3])
-    p_name = parts[4]
-    
-    text = f"⚙️ **Admin Control:** `{p_name}`\n👤 Owner: `{target_uid}`"
     btns = [
-        [InlineKeyboardButton("▶️ Start", callback_data=f"adm_act_start_{target_uid}_{p_name}"), InlineKeyboardButton("🛑 Stop", callback_data=f"adm_act_stop_{target_uid}_{p_name}")],
-        [InlineKeyboardButton("📥 Download Files", callback_data=f"adm_act_dl_{target_uid}_{p_name}")],
-        [InlineKeyboardButton("🗑️ DELETE (DB + Disk)", callback_data=f"adm_act_del_{target_uid}_{p_name}")],
-        [InlineKeyboardButton("🔙 Back", callback_data=f"adm_view_u_{target_uid}")]
+        [InlineKeyboardButton(block_btn_text, callback_data=f"acc_act_{block_action}_{target_id}")],
+        [InlineKeyboardButton("🗑️ Delete User (Revoke)", callback_data=f"acc_act_delete_{target_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="list_access_users")]
     ]
     await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(btns))
 
-@bot_app.on_callback_query(filters.regex(r"^adm_act_"))
-async def admin_actions(client, callback):
-    if callback.from_user.id != MAIN_OWNER_ID: return
+@bot_app.on_callback_query(filters.regex(r"^acc_act_"))
+async def access_user_actions(client, callback):
     parts = callback.data.split("_")
     action = parts[2]
-    target_uid = int(parts[3])
-    p_name = parts[4]
+    target_id = int(parts[3])
     
-    project_id = f"{target_uid}_{p_name}"
-    base_path = f"./deployments/{target_uid}/{p_name}"
-    
-    if action == "stop":
-        await stop_project_process(project_id)
-        await projects_col.update_one({"user_id": target_uid, "name": p_name}, {"$set": {"status": "Stopped"}})
-        await callback.answer("🛑 Stopped Forcefully")
-        
-    elif action == "start":
-        await ensure_files_exist(target_uid, p_name)
-        await start_process_logic(None, None, target_uid, p_name, silent=True)
-        await callback.answer("▶️ Started")
-        
-    elif action == "del":
-        await stop_project_process(project_id)
-        await projects_col.delete_one({"user_id": target_uid, "name": p_name})
-        if os.path.exists(base_path): shutil.rmtree(base_path)
-        await callback.answer("🗑️ Deleted Successfully")
-        await list_all_users(client, callback) # Return to list
+    if action == "block":
+        await users_col.update_one({"user_id": target_id}, {"$set": {"is_blocked": True}})
+        await callback.answer("User Blocked")
+    elif action == "unblock":
+        await users_col.update_one({"user_id": target_id}, {"$set": {"is_blocked": False}})
+        await callback.answer("User Unblocked")
+    elif action == "delete":
+        await users_col.delete_one({"user_id": target_id})
+        await callback.answer("User Deleted")
+        await list_access_users(client, callback)
         return
         
-    elif action == "dl":
-        await ensure_files_exist(target_uid, p_name)
-        if not os.path.exists(base_path): return await callback.answer("Files missing", show_alert=True)
-        
-        zip_path = f"/tmp/{p_name}_admin_dl"
-        shutil.make_archive(zip_path, 'zip', base_path)
-        await client.send_document(callback.from_user.id, f"{zip_path}.zip", caption=f"📥 **Files for {p_name}**\n👤 User: `{target_uid}`")
-        await callback.answer("Sent to your DM")
-    
-    # Refresh menu
-    await admin_project_options(client, callback)
+    await view_access_user(client, callback)
 
-# ================= USER DEPLOY FLOW =================
+# ================= USER PROJECT MANAGEMENT =================
 
 @bot_app.on_callback_query(filters.regex("deploy_new"))
 async def deploy_start(client, callback):
     user_id = callback.from_user.id
     USER_STATE[user_id] = {"step": "ask_name"}
-    await safe_edit(callback.message, "📂 **New Project**\nSend Name:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]]))
+    await safe_edit(callback.message, "📂 **New Project**\nSend Name (No Spaces):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="main_menu")]]))
 
 @bot_app.on_message(filters.text & filters.private)
 async def handle_text_input(client, message):
@@ -365,18 +296,19 @@ async def handle_text_input(client, message):
         state = USER_STATE[user_id]
         if state["step"] == "ask_name":
             proj_name = message.text.strip().replace(" ", "_")
-            exist = await projects_col.find_one({"user_id": user_id, "name": proj_name})
-            if exist: return await message.reply("❌ Name exists.")
+            if await projects_col.find_one({"user_id": user_id, "name": proj_name}):
+                return await message.reply("❌ Name exists.")
             USER_STATE[user_id] = {"step": "wait_files", "name": proj_name}
             await message.reply(f"✅ Project: `{proj_name}`\n**Send files now.**", reply_markup=ReplyKeyboardMarkup([[KeyboardButton("✅ Done / Start Deploy")]], resize_keyboard=True))
+        
         elif message.text == "✅ Done / Start Deploy":
-            if state["step"] == "wait_files":
-                await finish_deployment(client, message)
+            if state["step"] == "wait_files": await finish_deployment(client, message)
+            elif state["step"] == "update_files": await finish_update(client, message)
 
 @bot_app.on_message(filters.document & filters.private)
 async def handle_file_upload(client, message):
     user_id = message.from_user.id
-    if user_id in USER_STATE and USER_STATE[user_id]["step"] in ["wait_files"]:
+    if user_id in USER_STATE and USER_STATE[user_id]["step"] in ["wait_files", "update_files"]:
         data = USER_STATE[user_id]
         proj_name = data["name"]
         file_name = message.document.file_name
@@ -386,13 +318,28 @@ async def handle_file_upload(client, message):
         await message.download(save_path)
         with open(save_path, "rb") as f: content = f.read()
         await projects_col.update_one({"user_id": user_id, "name": proj_name}, {"$push": {"files": {"name": file_name, "content": content}}}, upsert=True)
-        await message.reply(f"📥 Received: `{file_name}`")
+        
+        if data["step"] == "update_files":
+            await message.reply(f"📥 Updated: `{file_name}`\nSend more or click 'Done'.", reply_markup=ReplyKeyboardMarkup([[KeyboardButton("✅ Done / Start Deploy")]], resize_keyboard=True))
+        else:
+            await message.reply(f"📥 Received: `{file_name}`")
 
 async def finish_deployment(client, message):
     user_id = message.from_user.id
     proj_name = USER_STATE[user_id]["name"]
     await message.reply("⚙️ **Deploying...**", reply_markup=ReplyKeyboardRemove())
     del USER_STATE[user_id]
+    await start_process_logic(client, message.chat.id, user_id, proj_name)
+
+async def finish_update(client, message):
+    user_id = message.from_user.id
+    proj_name = USER_STATE[user_id]["name"]
+    await message.reply("⚙️ **Files Updated. Restarting...**", reply_markup=ReplyKeyboardRemove())
+    del USER_STATE[user_id]
+    
+    # Restart the bot to apply changes
+    project_id = f"{user_id}_{proj_name}"
+    await stop_project_process(project_id)
     await start_process_logic(client, message.chat.id, user_id, proj_name)
 
 @bot_app.on_callback_query(filters.regex("manage_projects"))
@@ -408,7 +355,8 @@ async def list_projects(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^p_menu_"))
 async def user_project_menu(client, callback):
-    p_name = callback.data.replace("p_menu_", "")
+    # 🔥 FIXED: Robust Splitting for Names with Underscores
+    p_name = callback.data.replace("p_menu_", "") 
     user_id = callback.from_user.id
     project_id = f"{user_id}_{p_name}"
     doc = await projects_col.find_one({"user_id": user_id, "name": p_name})
@@ -420,6 +368,7 @@ async def user_project_menu(client, callback):
     
     btns = [
         [InlineKeyboardButton(status_text, callback_data=f"act_toggle_{p_name}")],
+        [InlineKeyboardButton("📤 Update Files", callback_data=f"act_upd_{p_name}")], # 🔥 NEW BUTTON
         [InlineKeyboardButton(log_text, callback_data=f"act_log_{p_name}"), InlineKeyboardButton("📥 Logs", callback_data=f"act_dl_{p_name}")],
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_del_{p_name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]
@@ -428,7 +377,8 @@ async def user_project_menu(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^act_"))
 async def user_actions(client, callback):
-    parts = callback.data.split("_")
+    # 🔥 FIXED: Split logic to handle names with underscores
+    parts = callback.data.split("_", 2) # Only split 2 times max
     action = parts[1]
     p_name = parts[2]
     user_id = callback.from_user.id
@@ -443,6 +393,10 @@ async def user_actions(client, callback):
             await ensure_files_exist(user_id, p_name)
             await start_process_logic(client, callback.message.chat.id, user_id, p_name)
         await user_project_menu(client, callback)
+        
+    elif action == "upd":
+        USER_STATE[user_id] = {"step": "update_files", "name": p_name}
+        await safe_edit(callback.message, f"📤 **Updating: `{p_name}`**\nSend new files now.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"p_menu_{p_name}")]]))
         
     elif action == "del":
         await stop_project_process(project_id)
@@ -471,17 +425,10 @@ async def back_main(client, callback):
 async def main():
     print("🚀 Starting Master Bot...")
     await bot_app.start()
-    
-    # 1. Start Dummy Web Server (Keep Alive)
     asyncio.create_task(start_dummy_server())
-    
-    # 2. Restore Projects
     await restore_all_projects()
-    
-    # 3. Resource Monitor
     asyncio.create_task(resource_monitor())
-    
-    print("✅ Bot is Online & Idle...")
+    print("✅ Bot Online")
     await idle()
     await bot_app.stop()
 
