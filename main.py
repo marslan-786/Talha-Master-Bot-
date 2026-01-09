@@ -21,7 +21,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 API_ID = 94575
 API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2"
 BOT_TOKEN = "8505785410:AAGiDN3FuECbg_K6N_qtjK7OjXh1YYPy5fk"
-MONGO_URL = "mongodb://mongo:AEvrikOWlrmJCQrDTQgfGtqLlwhwLuAA@crossover.proxy.rlwy.net:29609"
+MONGO_URL = "mongodb+srv://arslansalfi:786786aa@cluster0.yeycg3n.mongodb.net/?appName=Cluster0"
 
 PORT = int(os.environ.get("PORT", 8080))
 
