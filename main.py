@@ -27,7 +27,7 @@ PORT = int(os.environ.get("PORT", 8080))
 
 # 🔥 ROLES SETUP
 MAIN_OWNER_ID = 8167904992  
-OWNER_IDS = [8167904992, 7134046678] 
+OWNER_IDS = [8167904992, 7149369830] 
 
 # ========= DATABASE SETUP =========
 mongo_client = AsyncIOMotorClient(MONGO_URL)
