@@ -26,7 +26,7 @@ MONGO_URL = "mongodb+srv://arslansalfi:786786aa@cluster0.yeycg3n.mongodb.net/?ap
 PORT = int(os.environ.get("PORT", 8080))
 
 # 🔥 ROLES SETUP
-MAIN_OWNER_ID = 8167904992  
+# MAIN_OWNER_ID = 8167904992  
 OWNER_IDS = [8167904992, 7149369830] 
 
 # ========= DATABASE SETUP =========
@@ -211,7 +211,7 @@ async def owner_panel_cb(client, callback):
     if user_id not in OWNER_IDS: return await callback.answer("Admins only!", show_alert=True)
     
     btns = [[InlineKeyboardButton("🔑 Generate Key", callback_data="gen_key")]]
-    if user_id == MAIN_OWNER_ID:
+    if user_id == OWNER_IDS:
         btns.insert(0, [InlineKeyboardButton("👥 Authorized Users (Access)", callback_data="list_access_users")])
         btns.insert(0, [InlineKeyboardButton("📂 All Projects (Full Control)", callback_data="list_all_projects_adm")])
     
@@ -228,7 +228,7 @@ async def generate_key(client, callback):
 
 @bot_app.on_callback_query(filters.regex("list_access_users"))
 async def list_access_users(client, callback):
-    if callback.from_user.id != MAIN_OWNER_ID: return
+    if callback.from_user.id != OWNER_IDS: return
     
     users = await users_col.find({"user_id": {"$nin": OWNER_IDS}}).to_list(length=100)
     if not users: return await callback.answer("No authorized users found.", show_alert=True)
@@ -243,7 +243,7 @@ async def list_access_users(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^acc_view_"))
 async def view_access_user(client, callback):
-    if callback.from_user.id != MAIN_OWNER_ID: return
+    if callback.from_user.id != OWNER_IDS: return
     target_id = int(callback.data.split("_")[2])
     user = await users_col.find_one({"user_id": target_id})
     
