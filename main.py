@@ -25,8 +25,7 @@ MONGO_URL = "mongodb+srv://arslansalfi:786786aa@cluster0.yeycg3n.mongodb.net/?ap
 
 PORT = int(os.environ.get("PORT", 8080))
 
-# 🔥 ROLES SETUP
-MAIN_OWNER_ID = [8167904992, 7149369830]
+# 🔥 ROLES SETUP (Both IDs have FULL ACCESS now)
 OWNER_IDS = [8167904992, 7149369830] 
 
 # ========= DATABASE SETUP =========
@@ -210,25 +209,26 @@ async def owner_panel_cb(client, callback):
     user_id = callback.from_user.id
     if user_id not in OWNER_IDS: return await callback.answer("Admins only!", show_alert=True)
     
-    btns = [[InlineKeyboardButton("🔑 Generate Key", callback_data="gen_key")]]
-    if user_id == OWNER_IDS:
-        btns.insert(0, [InlineKeyboardButton("👥 Authorized Users (Access)", callback_data="list_access_users")])
-        btns.insert(0, [InlineKeyboardButton("📂 All Projects (Full Control)", callback_data="list_all_projects_adm")])
-    
-    btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    btns = [
+        [InlineKeyboardButton("👥 Authorized Users (Access)", callback_data="list_access_users")],
+        [InlineKeyboardButton("📂 All Projects (Full Control)", callback_data="list_all_projects_adm")],
+        [InlineKeyboardButton("🔑 Generate Key", callback_data="gen_key")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
+    ]
     await safe_edit(callback.message, "👑 **Owner Panel**", reply_markup=InlineKeyboardMarkup(btns))
 
 @bot_app.on_callback_query(filters.regex("gen_key"))
 async def generate_key(client, callback):
+    if callback.from_user.id not in OWNER_IDS: return
     new_key = str(uuid.uuid4())[:8]
     await keys_col.insert_one({"key": new_key, "status": "active", "created_by": callback.from_user.id})
     await safe_edit(callback.message, f"✅ Key: `{new_key}`\n`/start {new_key}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]))
 
-# ================= MANAGE ACCESS USERS (NEW) =================
+# ================= MANAGE ACCESS USERS =================
 
 @bot_app.on_callback_query(filters.regex("list_access_users"))
 async def list_access_users(client, callback):
-    if callback.from_user.id != OWNER_IDS: return
+    if callback.from_user.id not in OWNER_IDS: return
     
     users = await users_col.find({"user_id": {"$nin": OWNER_IDS}}).to_list(length=100)
     if not users: return await callback.answer("No authorized users found.", show_alert=True)
@@ -243,7 +243,7 @@ async def list_access_users(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^acc_view_"))
 async def view_access_user(client, callback):
-    if callback.from_user.id != OWNER_IDS: return
+    if callback.from_user.id not in OWNER_IDS: return
     target_id = int(callback.data.split("_")[2])
     user = await users_col.find_one({"user_id": target_id})
     
@@ -263,6 +263,7 @@ async def view_access_user(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^acc_act_"))
 async def access_user_actions(client, callback):
+    if callback.from_user.id not in OWNER_IDS: return
     parts = callback.data.split("_")
     action = parts[2]
     target_id = int(parts[3])
@@ -337,7 +338,6 @@ async def finish_update(client, message):
     await message.reply("⚙️ **Files Updated. Restarting...**", reply_markup=ReplyKeyboardRemove())
     del USER_STATE[user_id]
     
-    # Restart the bot to apply changes
     project_id = f"{user_id}_{proj_name}"
     await stop_project_process(project_id)
     await start_process_logic(client, message.chat.id, user_id, proj_name)
@@ -353,14 +353,16 @@ async def list_projects(client, callback):
     btns.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
     await safe_edit(callback.message, "📂 **Your Projects**", reply_markup=InlineKeyboardMarkup(btns))
 
+# 🔥 Fixed 'Project Not Found' Error
 @bot_app.on_callback_query(filters.regex(r"^p_menu_"))
-async def user_project_menu(client, callback):
-    # 🔥 FIXED: Robust Splitting for Names with Underscores
-    p_name = callback.data.replace("p_menu_", "") 
+async def user_project_menu(client, callback, p_name=None):
+    if not p_name:
+        p_name = callback.data.replace("p_menu_", "") 
+    
     user_id = callback.from_user.id
     project_id = f"{user_id}_{p_name}"
     doc = await projects_col.find_one({"user_id": user_id, "name": p_name})
-    if not doc: return await callback.answer("Project not found", show_alert=True)
+    if not doc: return await callback.answer("Project not found in DB!", show_alert=True)
     
     is_running = doc.get("status") == "Running"
     status_text = "🛑 Stop" if is_running else "▶️ Start"
@@ -368,7 +370,7 @@ async def user_project_menu(client, callback):
     
     btns = [
         [InlineKeyboardButton(status_text, callback_data=f"act_toggle_{p_name}")],
-        [InlineKeyboardButton("📤 Update Files", callback_data=f"act_upd_{p_name}")], # 🔥 NEW BUTTON
+        [InlineKeyboardButton("📤 Update Files", callback_data=f"act_upd_{p_name}")],
         [InlineKeyboardButton(log_text, callback_data=f"act_log_{p_name}"), InlineKeyboardButton("📥 Logs", callback_data=f"act_dl_{p_name}")],
         [InlineKeyboardButton("🗑️ Delete", callback_data=f"act_del_{p_name}")],
         [InlineKeyboardButton("🔙 Back", callback_data="manage_projects")]
@@ -377,8 +379,7 @@ async def user_project_menu(client, callback):
 
 @bot_app.on_callback_query(filters.regex(r"^act_"))
 async def user_actions(client, callback):
-    # 🔥 FIXED: Split logic to handle names with underscores
-    parts = callback.data.split("_", 2) # Only split 2 times max
+    parts = callback.data.split("_", 2)
     action = parts[1]
     p_name = parts[2]
     user_id = callback.from_user.id
@@ -392,7 +393,8 @@ async def user_actions(client, callback):
         else:
             await ensure_files_exist(user_id, p_name)
             await start_process_logic(client, callback.message.chat.id, user_id, p_name)
-        await user_project_menu(client, callback)
+        # Pass p_name explicitly to avoid 'Project Not Found'
+        await user_project_menu(client, callback, p_name=p_name)
         
     elif action == "upd":
         USER_STATE[user_id] = {"step": "update_files", "name": p_name}
@@ -413,7 +415,8 @@ async def user_actions(client, callback):
         
     elif action == "log":
         LOGGING_FLAGS[project_id] = not LOGGING_FLAGS.get(project_id, False)
-        await user_project_menu(client, callback)
+        # Pass p_name explicitly
+        await user_project_menu(client, callback, p_name=p_name)
 
 @bot_app.on_callback_query(filters.regex("main_menu"))
 async def back_main(client, callback):
